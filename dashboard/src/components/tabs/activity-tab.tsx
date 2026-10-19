@@ -6,6 +6,7 @@ import { copyText } from "../../lib/clipboard";
 import type { RecipientProfile } from "../../lib/types";
 import { ConfirmDialog } from "../primitives/confirm-dialog";
 import { TxLink } from "../primitives/tx-link";
+import { useActionReasoning, WhyDidThisHappen } from "../why-did-this-happen";
 import { formatTime, getTranslations, type Locale } from "../../i18n";
 import type {
   AgentLogEntry,
@@ -117,6 +118,8 @@ export function ActivityTab({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [preparingReport, setPreparingReport] = useState(false);
   const t = getTranslations(locale).activity;
+  // #1235: plain-language traces, refreshed as new transactions arrive.
+  const reasoning = useActionReasoning(allTransactions);
 
   // Reset clears the whole history, so count from pagination when it is known
   // rather than from the page in view.
@@ -231,7 +234,7 @@ export function ActivityTab({
               onClick={() => {
                 // CSV export: transactions with memo column
                 const header =
-                  "Time,Type,Description,Memo,Amount,Status,Stellar Tx\n";
+                  "Time,Type,Description,Memo,Amount,Status,Stellar Tx,Network Fee (XLM)\n";
                 const rows = allTransactions
                   .map((tx) =>
                     [
@@ -242,6 +245,9 @@ export function ActivityTab({
                       tx.amount.toFixed(2),
                       tx.status,
                       tx.stellarTxHash ?? "",
+                      tx.networkFeeStroops !== undefined
+                        ? (tx.networkFeeStroops / 10_000_000).toFixed(7)
+                        : "",
                     ].join(","),
                   )
                   .join("\n");
@@ -527,7 +533,12 @@ export function ActivityTab({
                             {tx.type}
                           </span>
                         </td>
-                        <td className="px-4 py-2 text-xs">{tx.description}</td>
+                        <td className="px-4 py-2 text-xs">
+                          {tx.description}
+                          {reasoning.byTransaction.get(tx.id) && (
+                            <WhyDidThisHappen reasoning={reasoning.byTransaction.get(tx.id)!} />
+                          )}
+                        </td>
                         {/* Memo — only shown on large screens; empty dash if not set */}
                         <td className="hidden lg:table-cell px-4 py-2 text-xs text-slate-500 italic">
                           {tx.memo ?? "-"}

@@ -148,6 +148,10 @@ export const TransactionSchema = z.object({
   // from the auto-generated description. Validated to the Stellar MEMO_TEXT
   // limit (28 bytes) so it can safely be used as an on-chain memo if needed.
   memo: z.string().max(28).optional(),
+  // Stellar network fee charged for this transaction, in stroops (#1232).
+  // Only set when the agent submitted the transaction itself and Horizon
+  // accepted it; payments settled by a third party (x402/MPP) leave it unset.
+  networkFeeStroops: z.number().int().nonnegative().optional(),
   // Medication order fulfilment lifecycle (Feature: order tracking).
   // Only present on medication-type transactions.
   order_status: z.enum(["submitted", "ready", "picked_up"]).optional(),
@@ -293,6 +297,164 @@ export const MultisigRequestSchema = z.object({
 export type MultisigPendingRequest = z.infer<typeof MultisigRequestSchema>;
 
 // ── Recipient Data Export (Issue #1225) ───────────────────────────────────────
+
+// Restored: these schemas were dropped in a merge but are still referenced
+// below and imported elsewhere.
+// ── PharmacyPrice ─────────────────────────────────────────────────────────────
+
+export const PharmacyPriceSchema = z.object({
+  pharmacyName: z.string().min(1),
+  pharmacyId: z.string().min(1),
+  price: z.number().nonnegative(),
+  distance: z.string().optional(),
+  inStock: z.union([z.boolean(), z.literal("unknown")]),
+});
+
+export type PharmacyPrice = z.infer<typeof PharmacyPriceSchema>;
+
+// ── PriceComparisonResult ─────────────────────────────────────────────────────
+
+export const PriceComparisonResultSchema = z.object({
+  drug: z.string().min(1),
+  dosage: z.string(),
+  zipCode: z.string(),
+  prices: z.array(PharmacyPriceSchema),
+  cheapest: PharmacyPriceSchema,
+  mostExpensive: PharmacyPriceSchema,
+  potentialSavings: z.number().nonnegative(),
+});
+
+export type PriceComparisonResult = z.infer<typeof PriceComparisonResultSchema>;
+
+// ── BillLineItem ──────────────────────────────────────────────────────────────
+
+export const BillLineItemSchema = z.object({
+  description: z.string().min(1),
+  cptCode: z.string().optional(),
+  chargedAmount: z.number().nonnegative(),
+  fairMarketRate: z.number().nonnegative().optional(),
+  status: z.enum(["valid", "duplicate", "upcoded", "unbundled", "error"]),
+  errorDescription: z.string().optional(),
+  suggestedAmount: z.number().nonnegative().optional(),
+});
+
+export type BillLineItem = z.infer<typeof BillLineItemSchema>;
+
+// ── BillAuditResult ───────────────────────────────────────────────────────────
+
+export const BillAuditResultSchema = z.object({
+  totalCharged: z.number().nonnegative(),
+  totalCorrect: z.number().nonnegative(),
+  totalOvercharge: z.number().nonnegative(),
+  errorCount: z.number().int().nonnegative(),
+  lineItems: z.array(BillLineItemSchema),
+  recommendation: z.string(),
+});
+
+export type BillAuditResult = z.infer<typeof BillAuditResultSchema>;
+// ── Allergies & Adverse Reactions (Issue #1230) ────────────────────────────────
+
+export const AllergySeveritySchema = z.enum([
+  'mild',
+  'moderate',
+  'severe',
+  'life_threatening',
+]);
+
+export type AllergySeverity = z.infer<typeof AllergySeveritySchema>;
+
+export const RecipientAllergySchema = z.object({
+  id: z.string().min(1),
+  substance: z.string().min(1),
+  severity: AllergySeveritySchema,
+  reaction: z.string().optional(),
+  notes: z.string().optional(),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().optional(),
+});
+
+export type RecipientAllergy = z.infer<typeof RecipientAllergySchema>;
+
+// ── Co-Caregiver Presence (Issue #1231) ───────────────────────────────────────
+
+export const ItemPresenceEntrySchema = z.object({
+  caregiverId: z.string().min(1),
+  caregiverName: z.string().min(1),
+  avatar: z.string().optional(),
+  lastViewedAt: z.string().min(1),
+});
+
+export type ItemPresenceEntry = z.infer<typeof ItemPresenceEntrySchema>;
+
+export type ItemPresenceMap = Record<string, ItemPresenceEntry[]>;
+
+export const SpendingPolicySchema = z
+  .object({
+    dailyLimit: z
+      .number()
+      .gt(0, "dailyLimit must be greater than 0")
+      .max(10_000, "dailyLimit cannot exceed $10,000"),
+    monthlyLimit: z
+      .number()
+      .gt(0, "monthlyLimit must be greater than 0")
+      .max(100_000, "monthlyLimit cannot exceed $100,000"),
+    medicationMonthlyBudget: z
+      .number()
+      .gt(0, "medicationMonthlyBudget must be greater than 0")
+      .max(50_000, "medicationMonthlyBudget cannot exceed $50,000"),
+    billMonthlyBudget: z
+      .number()
+      .gt(0, "billMonthlyBudget must be greater than 0")
+      .max(50_000, "billMonthlyBudget cannot exceed $50,000"),
+    approvalThreshold: z
+      .number()
+      .gt(0, "approvalThreshold must be greater than 0")
+      .max(10_000, "approvalThreshold cannot exceed $10,000"),
+    holdTimeSeconds: z.number().int("holdTimeSeconds must be an integer").min(0).max(86_400).default(0),
+    /**
+     * IANA timezone string for the caregiver's local day (Issue #207).
+     * Example: "America/Phoenix", "America/New_York", "Europe/London".
+     * When set, daily-limit checks use this timezone to determine "today"
+     * rather than UTC or the global SPENDING_TIMEZONE env var.
+     * Defaults to the SPENDING_TIMEZONE env var if omitted.
+     */
+    timezone: z.string().optional(),
+    toolFees: z.record(z.string(), z.number().min(0)).optional(),
+    notifications: z
+      .object({
+        email: z.boolean(),
+        sms: z.boolean(),
+        emailAddress: z.string().optional(),
+        phoneNumber: z.string().optional(),
+      })
+      .optional(),
+    priceWatch: z
+      .object({
+        enabled: z.boolean().default(true),
+        optOutMeds: z.array(z.string()).default([]),
+        minSavingsThreshold: z.number().nonnegative().default(5.00),
+        minSavingsPercent: z.number().nonnegative().default(15),
+      })
+      .optional(),
+  })
+  .refine((p) => p.dailyLimit <= p.monthlyLimit, {
+    message: "dailyLimit cannot exceed monthlyLimit",
+    path: ["dailyLimit"],
+  })
+  .refine((p) => p.approvalThreshold <= p.dailyLimit, {
+    message: "approvalThreshold cannot exceed dailyLimit",
+    path: ["approvalThreshold"],
+  })
+  .refine(
+    (p) => p.medicationMonthlyBudget + p.billMonthlyBudget <= p.monthlyLimit,
+    {
+      message:
+        "medicationMonthlyBudget + billMonthlyBudget cannot exceed monthlyLimit",
+      path: ["medicationMonthlyBudget"],
+    },
+  );
+
+export type SpendingPolicy = z.infer<typeof SpendingPolicySchema>;
 
 export const RecipientExportBundleSchema = z.object({
   exportMetadata: z.object({

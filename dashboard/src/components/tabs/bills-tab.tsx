@@ -31,6 +31,7 @@ import type { AgentResult } from "../types";
 import { getTranslations, type Locale } from "../../i18n";
 import { AGENT_URL } from "../../lib/agent-url";
 import { agentFetch } from "../../lib/agent-fetch";
+import { useActionReasoning, WhyDidThisHappen } from "../why-did-this-happen";
 
 export interface EditableLineItem {
   id: string;
@@ -79,6 +80,9 @@ export function BillsTab({
   const [presenceMap, setPresenceMap] = useState<ItemPresenceMap>({});
   const [savingsWindow, setSavingsWindow] = useState<"month" | "year" | "all">("all");
   const b = getTranslations(locale).bills;
+  // #1235: reasoning traces for audits and bill payments from the latest run.
+  const reasoning = useActionReasoning(agentResult);
+  const billPaymentCalls = (agentResult?.toolCalls ?? []).filter((tc) => tc.tool === "pay_bill");
 
   const isRestricted =
     currentCaregiver &&
@@ -932,6 +936,59 @@ export function BillsTab({
                   <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-sky-100 text-sky-800 w-fit">
                     Historical Baseline
                   </span>
+                </div>
+              )}
+
+              {/* Out-of-network provider finding (#1234) — a distinct finding
+                  type, explained in full rather than shown as a bare badge. */}
+              {(tc.result.findings ?? [])
+                .filter((f: any) => f?.type === "out_of_network_provider")
+                .map((f: any, i: number) => (
+                  <div
+                    key={`oon-${i}`}
+                    role="note"
+                    aria-label="Out-of-network provider"
+                    data-testid="out-of-network-finding"
+                    className="bg-orange-50 border border-orange-200 rounded-xl p-4 text-xs text-orange-900"
+                  >
+                    <div className="flex items-center justify-between gap-2 mb-1">
+                      <p className="font-semibold uppercase tracking-wide">Out-of-network provider</p>
+                      <span className="px-2 py-0.5 rounded bg-orange-100 font-medium">
+                        ${Number(f.amountAtRisk ?? 0).toFixed(2)} at risk
+                      </span>
+                    </div>
+                    <p className="text-sm break-words">{f.explanation}</p>
+                  </div>
+                ))}
+
+              {/* Why the agent flagged this bill (#1235) */}
+              {tc.id && reasoning.byToolCall.get(tc.id) && (
+                <WhyDidThisHappen reasoning={reasoning.byToolCall.get(tc.id)!} />
+              )}
+
+              {/* Bill payment decisions from the same run, with their reasoning (#1235) */}
+              {billPaymentCalls.length > 0 && (
+                <div className="rounded-xl border border-slate-200 p-3 space-y-2" data-testid="bill-payment-decisions">
+                  <p className="text-xs font-semibold text-slate-700">Bill payment decisions</p>
+                  {billPaymentCalls.map((pay, i) => {
+                    const trace =
+                      (pay.id && reasoning.byToolCall.get(pay.id)) ||
+                      (pay.result?.transaction?.id && reasoning.byTransaction.get(pay.result.transaction.id));
+                    return (
+                      <div key={pay.id ?? `pay-${i}`} className="text-xs text-slate-600">
+                        <span className="font-medium text-slate-700">
+                          {pay.result?.transaction?.description ?? "Bill payment"}
+                        </span>{" "}
+                        —{" "}
+                        {pay.result?.success
+                          ? "paid"
+                          : pay.result?.transaction?.status === "pending"
+                            ? "held for approval"
+                            : "not paid"}
+                        {trace && <WhyDidThisHappen reasoning={trace} />}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
 
