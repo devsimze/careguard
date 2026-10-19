@@ -20,6 +20,9 @@ vi.mock("../components/primitives/tx-link", () => ({
 vi.mock("../components/primitives/confirm-dialog", () => ({
   ConfirmDialog: () => null,
 }));
+vi.mock("../components/agent-history-section", () => ({
+  AgentHistorySection: () => null,
+}));
 
 function makeTx(id: string, timestamp: string): Transaction {
   return {

@@ -8,6 +8,7 @@ export const BillLineItemSchema = z.object({
   status: z.enum(["valid", "duplicate", "upcoded", "unbundled", "error"]),
   suggestedAmount: z.number().optional(),
   errorDescription: z.string().optional(),
+  annotation: z.string().optional(),
 });
 
 export const BillAuditResultSchema = z.object({
@@ -147,6 +148,7 @@ export const SpendingDataSchema = z.object({
     billMonthlyBudget: z.number(),
     approvalThreshold: z.number(),
     holdTimeSeconds: z.number().optional().default(86400),
+    warningThresholdPct: z.number().optional(),
   }),
   spending: z.object({
     medications: z.number(),
@@ -256,6 +258,33 @@ export const InteractionCheckSchema = z.object({
 });
 
 export type InteractionCheck = z.infer<typeof InteractionCheckSchema>;
+
+/** A record an agent tool invocation produced, for link-through from history. */
+export const AgentHistoryLinkSchema = z.object({
+  kind: z.enum(["transaction", "dispute", "bill_audit", "interaction_check", "approval"]),
+  id: z.string().optional(),
+  label: z.string(),
+  stellarTxHash: z.string().optional(),
+});
+
+export type AgentHistoryLink = z.infer<typeof AgentHistoryLinkSchema>;
+
+/** A persisted agent tool invocation and its outcome (redacted server-side). */
+export const AgentHistoryEntrySchema = z.object({
+  id: z.string(),
+  recipient_id: z.string(),
+  run_id: z.string().nullable(),
+  task: z.string().nullable(),
+  tool: z.string(),
+  input: z.record(z.string(), z.unknown()),
+  status: z.enum(["success", "error", "blocked", "pending"]),
+  summary: z.string(),
+  error: z.string().nullable(),
+  links: z.array(AgentHistoryLinkSchema),
+  created_at: z.string(),
+});
+
+export type AgentHistoryEntry = z.infer<typeof AgentHistoryEntrySchema>;
 
 /** Human-readable reading, e.g. "128/82 mmHg" or "162 lb". */
 export function formatVital(v: Pick<Vital, "type" | "value" | "secondary_value" | "unit">): string {

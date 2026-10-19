@@ -14,7 +14,10 @@ export interface DashboardTabsNavProps {
   locale?: Locale;
 }
 
-export function DashboardTabsNav({ activeTab, pathname, approvalsCount, locale = "en" }: DashboardTabsNavProps) {
+export function DashboardTabsNav({
+  activeTab,
+  pathname,
+}: DashboardTabsNavProps) {
   const [focusedTab, setFocusedTab] = useState<Tab>(activeTab);
   const t = getTranslations(locale);
 

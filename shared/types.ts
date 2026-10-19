@@ -46,7 +46,79 @@ export type Medication = z.infer<typeof MedicationSchema>;
 
 // ── PharmacyPrice ─────────────────────────────────────────────────────────────
 
-export type SeverityThreshold = 'any' | 'major' | 'moderate' | 'mild';
+export const PharmacyPriceSchema = z.object({
+  pharmacyName: z.string().min(1),
+  pharmacyId: z.string().min(1),
+  price: z.number().nonnegative(),
+  distance: z.string().optional(),
+  inStock: z.union([z.boolean(), z.literal("unknown")]),
+});
+
+export type PharmacyPrice = z.infer<typeof PharmacyPriceSchema>;
+
+// ── PriceComparisonResult ─────────────────────────────────────────────────────
+
+export const PriceComparisonResultSchema = z.object({
+  drug: z.string().min(1),
+  dosage: z.string(),
+  zipCode: z.string(),
+  prices: z.array(PharmacyPriceSchema),
+  cheapest: PharmacyPriceSchema,
+  mostExpensive: PharmacyPriceSchema,
+  potentialSavings: z.number().nonnegative(),
+});
+
+export type PriceComparisonResult = z.infer<typeof PriceComparisonResultSchema>;
+
+// ── BillLineItem ──────────────────────────────────────────────────────────────
+
+export const BillLineItemSchema = z.object({
+  description: z.string().min(1),
+  cptCode: z.string().optional(),
+  chargedAmount: z.number().nonnegative(),
+  fairMarketRate: z.number().nonnegative().optional(),
+  status: z.enum(["valid", "duplicate", "upcoded", "unbundled", "error"]),
+  errorDescription: z.string().optional(),
+  suggestedAmount: z.number().nonnegative().optional(),
+});
+
+export type BillLineItem = z.infer<typeof BillLineItemSchema>;
+
+// ── BillAuditResult ───────────────────────────────────────────────────────────
+
+export const BillAuditResultSchema = z.object({
+  totalCharged: z.number().nonnegative(),
+  totalCorrect: z.number().nonnegative(),
+  totalOvercharge: z.number().nonnegative(),
+  errorCount: z.number().int().nonnegative(),
+  lineItems: z.array(BillLineItemSchema),
+  recommendation: z.string(),
+});
+
+export type BillAuditResult = z.infer<typeof BillAuditResultSchema>;
+
+// ── Allergies & Adverse Reactions (Issue #1230) ────────────────────────────────
+
+export const AllergySeveritySchema = z.enum([
+  'mild',
+  'moderate',
+  'severe',
+  'life_threatening',
+]);
+
+export type AllergySeverity = z.infer<typeof AllergySeveritySchema>;
+
+export const RecipientAllergySchema = z.object({
+  id: z.string().min(1),
+  substance: z.string().min(1),
+  severity: AllergySeveritySchema,
+  reaction: z.string().optional(),
+  notes: z.string().optional(),
+  createdAt: z.string().min(1),
+  updatedAt: z.string().optional(),
+});
+
+export type RecipientAllergy = z.infer<typeof RecipientAllergySchema>;
 
 export interface SideEffectEntry {
   id: string;
@@ -56,6 +128,8 @@ export interface SideEffectEntry {
   severity: 'mild' | 'moderate' | 'severe';
   timestamp: string;
 }
+
+export type SeverityThreshold = 'any' | 'major' | 'moderate' | 'mild';
 
 export interface SpendingPolicy {
   dailyLimit: number;
@@ -298,83 +372,6 @@ export type MultisigPendingRequest = z.infer<typeof MultisigRequestSchema>;
 
 // ── Recipient Data Export (Issue #1225) ───────────────────────────────────────
 
-// Restored: these schemas were dropped in a merge but are still referenced
-// below and imported elsewhere.
-// ── PharmacyPrice ─────────────────────────────────────────────────────────────
-
-export const PharmacyPriceSchema = z.object({
-  pharmacyName: z.string().min(1),
-  pharmacyId: z.string().min(1),
-  price: z.number().nonnegative(),
-  distance: z.string().optional(),
-  inStock: z.union([z.boolean(), z.literal("unknown")]),
-});
-
-export type PharmacyPrice = z.infer<typeof PharmacyPriceSchema>;
-
-// ── PriceComparisonResult ─────────────────────────────────────────────────────
-
-export const PriceComparisonResultSchema = z.object({
-  drug: z.string().min(1),
-  dosage: z.string(),
-  zipCode: z.string(),
-  prices: z.array(PharmacyPriceSchema),
-  cheapest: PharmacyPriceSchema,
-  mostExpensive: PharmacyPriceSchema,
-  potentialSavings: z.number().nonnegative(),
-});
-
-export type PriceComparisonResult = z.infer<typeof PriceComparisonResultSchema>;
-
-// ── BillLineItem ──────────────────────────────────────────────────────────────
-
-export const BillLineItemSchema = z.object({
-  description: z.string().min(1),
-  cptCode: z.string().optional(),
-  chargedAmount: z.number().nonnegative(),
-  fairMarketRate: z.number().nonnegative().optional(),
-  status: z.enum(["valid", "duplicate", "upcoded", "unbundled", "error"]),
-  errorDescription: z.string().optional(),
-  suggestedAmount: z.number().nonnegative().optional(),
-});
-
-export type BillLineItem = z.infer<typeof BillLineItemSchema>;
-
-// ── BillAuditResult ───────────────────────────────────────────────────────────
-
-export const BillAuditResultSchema = z.object({
-  totalCharged: z.number().nonnegative(),
-  totalCorrect: z.number().nonnegative(),
-  totalOvercharge: z.number().nonnegative(),
-  errorCount: z.number().int().nonnegative(),
-  lineItems: z.array(BillLineItemSchema),
-  recommendation: z.string(),
-});
-
-export type BillAuditResult = z.infer<typeof BillAuditResultSchema>;
-// ── Allergies & Adverse Reactions (Issue #1230) ────────────────────────────────
-
-export const AllergySeveritySchema = z.enum([
-  'mild',
-  'moderate',
-  'severe',
-  'life_threatening',
-]);
-
-export type AllergySeverity = z.infer<typeof AllergySeveritySchema>;
-
-export const RecipientAllergySchema = z.object({
-  id: z.string().min(1),
-  substance: z.string().min(1),
-  severity: AllergySeveritySchema,
-  reaction: z.string().optional(),
-  notes: z.string().optional(),
-  createdAt: z.string().min(1),
-  updatedAt: z.string().optional(),
-});
-
-export type RecipientAllergy = z.infer<typeof RecipientAllergySchema>;
-
 // ── Co-Caregiver Presence (Issue #1231) ───────────────────────────────────────
 
 export const ItemPresenceEntrySchema = z.object({
@@ -436,6 +433,16 @@ export const SpendingPolicySchema = z
         minSavingsPercent: z.number().nonnegative().default(15),
       })
       .optional(),
+    /**
+     * Soft-warning threshold as a percentage (1–99) of each budget.
+     * When spending crosses this fraction of a budget limit the agent fires a
+     * warning notification but does NOT block the transaction.
+     * Distinct from `approvalThreshold` (hard dollar gate) and from the hard
+     * block limits (dailyLimit, monthlyLimit, category budgets).
+     * Example: 80 → warn when spend reaches 80% of a budget.
+     * Defaults to DEFAULT_WARNING_THRESHOLD_PCT (80) when not set by the caregiver.
+     */
+    warningThresholdPct: z.number().int().min(1).max(99).optional(),
   })
   .refine((p) => p.dailyLimit <= p.monthlyLimit, {
     message: "dailyLimit cannot exceed monthlyLimit",

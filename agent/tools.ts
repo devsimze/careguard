@@ -111,59 +111,6 @@ import {
   createMockReceipt,
   isMockNetwork,
 } from "../shared/network-mode.ts";
-import {
-  checkMedicationAllergies,
-  loadRecipientAllergies,
-  addRecipientAllergy,
-  removeRecipientAllergy,
-  type RecipientAllergy,
-  type AllergyCheckResult,
-} from "../shared/allergies.ts";
-import {
-  type RecipientAllergy,
-  type MultisigConfig,
-  type MultisigPendingRequest,
-} from "../shared/types.ts";
-import {
-  isMultisigRequired,
-  createMultisigRequest,
-  loadMultisigConfig,
-  saveMultisigConfig,
-  loadMultisigRequests,
-  signAndSubmitMultisigRequest,
-  rejectMultisigRequest,
-} from "../shared/multisig.ts";
-import {
-  getMedicationHistory,
-  recordDosageChange,
-  getActiveDosageAtTime,
-} from "../shared/medication-history.ts";
-import {
-  runPriceWatchForRecipient,
-  type PriceWatchResult,
-} from "./price-watch.ts";
-import {
-  extractLineItemsFromBillImage,
-  type OcrExtractionResult,
-} from "../shared/bill-ocr.ts";
-import { FETCH_TOOL_RESULT_MAX_LIMIT } from "./tool-result.ts";
-import { redactPII } from "../shared/redact.ts";
-import {
-  DEFAULT_RECIPIENT_ID,
-  getCareRecipientsStore,
-} from "../services/care-recipients/db.ts";
-import {
-  HANDOFF_NOTES_TOOL_DEFAULT,
-  HANDOFF_NOTES_TOOL_MAX,
-} from "./tool-input-validation.ts";
-import { getProviderBillHistoryStore } from "../services/bill-audit-api/history.ts";
-import {
-  DISPUTE_TEMPLATES,
-  type DisputeReasonTemplate,
-  inferDisputeTemplate,
-  formatDisputeLetter,
-} from "../shared/dispute-templates.ts";
-import type { CostSplitShare } from "../shared/cost-split.ts";
 
 assertMockNetworkAllowed();
 
@@ -666,7 +613,7 @@ const DEFAULT_POLICY: SpendingPolicy = {
   billMonthlyBudget: 500,
   approvalThreshold: 75,
   holdTimeSeconds: 0,
-  severityThreshold: 'any',
+  warningThresholdPct: 80,
   toolFees: {
     comparePharmacyPrices: 0.002,
     auditBill: 0.01,
@@ -784,37 +731,69 @@ const SpendingTrackerSchema = z.object({
 });
 
 type PaymentCategory =
-  | typeof TRANSACTION_CATEGORY.MEDICATIONS
-  | typeof TRANSACTION_CATEGORY.BILLS;
+  typeof TRANSACTION_CATEGORY.MEDICATIONS | typeof TRANSACTION_CATEGORY.BILLS;
 
 // Zod schema for spending policy — enforces positive values, sane upper bounds,
 // and cross-field ordering. holdTimeSeconds uses .min(0) because DEFAULT_POLICY sets it to 0.
-export const SpendingPolicySchema = z.object({
-  dailyLimit: z.number().gt(0, 'dailyLimit must be greater than 0').max(10_000, 'dailyLimit cannot exceed $10,000'),
-  monthlyLimit: z.number().gt(0, 'monthlyLimit must be greater than 0').max(100_000, 'monthlyLimit cannot exceed $100,000'),
-  medicationMonthlyBudget: z.number().gt(0, 'medicationMonthlyBudget must be greater than 0').max(50_000, 'medicationMonthlyBudget cannot exceed $50,000'),
-  billMonthlyBudget: z.number().gt(0, 'billMonthlyBudget must be greater than 0').max(50_000, 'billMonthlyBudget cannot exceed $50,000'),
-  approvalThreshold: z.number().gt(0, 'approvalThreshold must be greater than 0').max(10_000, 'approvalThreshold cannot exceed $10,000'),
-  holdTimeSeconds: z.number().min(0).max(86_400).default(0),
-  severityThreshold: z.enum(['any', 'major', 'moderate', 'mild']).default('any'),
-  timezone: z.string().optional(),
-  toolFees: z.record(z.number().min(0)).optional(),
-  notifications: z.object({
-    email: z.boolean(),
-    sms: z.boolean(),
-    emailAddress: z.string().email().optional(),
-    phoneNumber: z.string().optional(),
-  }).optional(),
-}).refine(
-  (p) => p.dailyLimit <= p.monthlyLimit,
-  { message: 'dailyLimit cannot exceed monthlyLimit', path: ['dailyLimit'] },
-).refine(
-  (p) => p.approvalThreshold <= p.dailyLimit,
-  { message: 'approvalThreshold cannot exceed dailyLimit', path: ['approvalThreshold'] },
-).refine(
-  (p) => p.medicationMonthlyBudget + p.billMonthlyBudget <= p.monthlyLimit,
-  { message: 'medicationMonthlyBudget + billMonthlyBudget cannot exceed monthlyLimit', path: ['medicationMonthlyBudget'] },
-);
+export const SpendingPolicySchema = z
+  .object({
+    dailyLimit: z
+      .number()
+      .gt(0, "dailyLimit must be greater than 0")
+      .max(10_000, "dailyLimit cannot exceed $10,000"),
+    monthlyLimit: z
+      .number()
+      .gt(0, "monthlyLimit must be greater than 0")
+      .max(100_000, "monthlyLimit cannot exceed $100,000"),
+    medicationMonthlyBudget: z
+      .number()
+      .gt(0, "medicationMonthlyBudget must be greater than 0")
+      .max(50_000, "medicationMonthlyBudget cannot exceed $50,000"),
+    billMonthlyBudget: z
+      .number()
+      .gt(0, "billMonthlyBudget must be greater than 0")
+      .max(50_000, "billMonthlyBudget cannot exceed $50,000"),
+    approvalThreshold: z
+      .number()
+      .gt(0, "approvalThreshold must be greater than 0")
+      .max(10_000, "approvalThreshold cannot exceed $10,000"),
+    holdTimeSeconds: z.number().min(0).max(86_400).default(0),
+    timezone: z.string().optional(),
+    toolFees: z.record(z.number().min(0)).optional(),
+    notifications: z
+      .object({
+        email: z.boolean(),
+        sms: z.boolean(),
+        emailAddress: z.string().email().optional(),
+        phoneNumber: z.string().optional(),
+      })
+      .optional(),
+    /**
+     * Soft-warning threshold as a percentage (1–99) of each category budget.
+     * When spending crosses this fraction the agent fires a warning notification
+     * but does NOT block the transaction. Defaults to DEFAULT_WARNING_THRESHOLD_PCT.
+     */
+    warningThresholdPct: z.number().int().min(1).max(99).optional(),
+  })
+  .refine((p) => p.dailyLimit <= p.monthlyLimit, {
+    message: "dailyLimit cannot exceed monthlyLimit",
+    path: ["dailyLimit"],
+  })
+  .refine((p) => p.approvalThreshold <= p.dailyLimit, {
+    message: "approvalThreshold cannot exceed dailyLimit",
+    path: ["approvalThreshold"],
+  })
+  .refine(
+    (p) => p.medicationMonthlyBudget + p.billMonthlyBudget <= p.monthlyLimit,
+    {
+      message:
+        "medicationMonthlyBudget + billMonthlyBudget cannot exceed monthlyLimit",
+      path: ["medicationMonthlyBudget"],
+    },
+  );
+
+/** Default soft-warning threshold: warn at 80% of any budget. */
+export const DEFAULT_WARNING_THRESHOLD_PCT = 80;
 
 type SpendingPolicyInput = z.infer<typeof SpendingPolicySchema>;
 
@@ -2132,6 +2111,46 @@ export function checkSpendingPolicy(amount: number, category: PaymentCategory) {
     };
   }
 
+  // Soft-warning threshold check: fires a notification when spending will cross
+  // warningThresholdPct of the category budget after this payment, but does NOT
+  // block the transaction. Logged distinctly from a policy block via the
+  // 'policy.budget_warning' audit event so caregivers can filter for soft vs hard.
+  const thresholdPct =
+    policy.warningThresholdPct ?? DEFAULT_WARNING_THRESHOLD_PCT;
+  const projectedSpend = currentSpending + amount;
+  const projectedPct = budget > 0 ? (projectedSpend / budget) * 100 : 0;
+  if (projectedPct >= thresholdPct) {
+    const warningMsg = `Spending on ${category} will reach ${projectedPct.toFixed(0)}% of the $${budget} budget after this payment ($${projectedSpend.toFixed(2)} of $${budget}).`;
+    appendAuditEntry({
+      event: "policy.budget_warning",
+      actor: "agent",
+      details: {
+        category,
+        amount,
+        currentSpending,
+        projectedSpend: +projectedSpend.toFixed(2),
+        budget,
+        thresholdPct,
+        projectedPct: +projectedPct.toFixed(1),
+      },
+    });
+    notify({
+      level: "warning",
+      title: `Budget Warning — ${category}`,
+      description: warningMsg,
+      context: {
+        category,
+        thresholdPct,
+        projectedPct: +projectedPct.toFixed(1),
+        budget,
+      },
+    });
+    logger.warn(
+      { category, thresholdPct, projectedPct: +projectedPct.toFixed(1) },
+      "[Policy] soft warning threshold crossed",
+    );
+  }
+
   return {
     allowed: true,
     requiresApproval: amount >= policy.approvalThreshold,
@@ -2139,6 +2158,13 @@ export function checkSpendingPolicy(amount: number, category: PaymentCategory) {
     budgetRemaining: roundBudget(remaining - amount),
     dailyRemaining,
     monthlyRemaining,
+    ...(projectedPct >= thresholdPct
+      ? {
+          budgetWarning: true,
+          budgetWarningPct: +projectedPct.toFixed(1),
+          warningThresholdPct: thresholdPct,
+        }
+      : {}),
   };
 }
 
@@ -2538,132 +2564,21 @@ export async function payForMedication(
       error: `BLOCKED BY PLATFORM CAP: $${amount.toFixed(2)} exceeds MAX_SINGLE_TX_USDC ($${getPlatformTxCap().toFixed(2)})`,
     };
   }
-
-  // Check recipient allergies (Issue #1230)
-  const allergyCheck = checkMedicationAllergies(drugName, targetRecipientId);
-  if (allergyCheck.blocked) {
-    const primaryConflict = allergyCheck.conflicts.find(
-      (c) => c.severity === "severe" || c.severity === "life_threatening",
-    );
-    logger.warn(
-      { drugName, recipientId: targetRecipientId, conflict: primaryConflict },
-      "[allergy-check] payment blocked due to severe allergy contraindication",
-    );
-    return {
-      success: false,
-      blocked: true,
-      reason: "ALLERGY_CONTRAINDICATION",
-      error: `BLOCKED BY ALLERGY GUARD: Patient has documented ${primaryConflict?.severity.replace("_", "-")} allergy to ${primaryConflict?.allergy.substance}. Cannot order ${drugName}.`,
-      conflicts: allergyCheck.conflicts,
-    };
-  // Validate optional memo: Stellar MEMO_TEXT is limited to 28 bytes.
-  if (memo !== undefined) {
-    const memoBytes = Buffer.byteLength(memo, "utf8");
-    if (memoBytes > STELLAR_MEMO_TEXT_MAX_BYTES) {
-      return {
-        success: false,
-        error: `Memo too long: ${memoBytes} bytes. Maximum is ${STELLAR_MEMO_TEXT_MAX_BYTES} bytes for Stellar MEMO_TEXT.`,
-      };
-    }
-  }
-
   // Atomically check policy and reserve the budget before the async payment
-  // check when only one slot remains in the budget.
-  const release = await getBudgetMutex(currentRecipientId).acquire();
-  let policyCheck: ReturnType<typeof checkSpendingPolicy>;
-  try {
-    rotateMonthIfNeeded(spendingTracker);
-    policyCheck = checkSpendingPolicy(amount, TRANSACTION_CATEGORY.MEDICATIONS);
-    if (!policyCheck.allowed) {
-      const reason = policyCheck.reason!.includes("daily")
-        ? "daily_limit"
-        : policyCheck.reason!.includes("overall monthly limit")
-          ? "monthly_limit"
-          : "budget";
-      policyBlocksTotal.inc({ reason });
-      paymentRejectedTotal.inc({ reason });
-
-      const tx = {
-        id: `tx-${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        type: "medication" as const,
-        description: `${drugName} from ${pharmacyName}`,
-        amount,
-        recipient: pharmacyId,
-        status: "blocked" as const,
-        category: TRANSACTION_CATEGORY.MEDICATIONS,
-      };
-      spendingTracker.transactions.push(tx);
-      appendTransaction(tx as any);
-
-      // Notify caregiver that a payment was blocked by policy (push channel
-      // included via "all" — Feature: push notifications).
-      notify({
-        level: "warning",
-        title: "Payment blocked by spending policy",
-        description: `$${amount.toFixed(2)} for ${drugName} from ${pharmacyName} was blocked. Reason: ${reason}.`,
-        context: { recipientId: currentRecipientId, txId: tx.id, reason },
-        recipientCaregiverId: "caregiver",
-      });
-
-      // Surface the full budget context so the LLM can decide whether to ask
-      // the caregiver for an override or pick a cheaper option (Issue #160).
-      const dailyRemaining = policyCheck.dailyRemaining ?? 0;
-      const monthlyRemaining = policyCheck.monthlyRemaining ?? 0;
-      const budgetContext = {
-        reason,
-        attempted: amount,
-        dailyRemaining,
-        monthlyRemaining,
-        suggestion:
-          `Relay this to the caregiver: the $${amount.toFixed(2)} payment was blocked by the spending policy. ` +
-          `Remaining budget is $${dailyRemaining.toFixed(2)} today and $${monthlyRemaining.toFixed(2)} this month for ${TRANSACTION_CATEGORY.MEDICATIONS}. ` +
-          `Ask them to approve a one-time override, or choose a cheaper option that fits the remaining budget.`,
-      };
-
-      return {
-        success: false,
-        error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
-        transaction: tx,
-        budgetContext,
-      };
-    }
-
-    if (policyCheck.requiresApproval && !skipApproval) {
-      policyBlocksTotal.inc({ reason: "approval_required" });
-      const holdSeconds = (currentPolicy as any)?.holdTimeSeconds ?? 0;
-      const submittedAt = new Date().toISOString();
-      const pendingUntil = new Date(
-        Date.now() + holdSeconds * 1000,
-      ).toISOString();
-      const tx: Transaction & { pendingUntil?: string; submittedAt?: string } =
-        {
-          id: `tx-${Date.now()}`,
-          timestamp: submittedAt,
-          type: "medication" as const,
-          description: `${drugName} from ${pharmacyName}`,
-          amount,
-          recipient: pharmacyId,
-          status: "pending" as const,
-          category: TRANSACTION_CATEGORY.MEDICATIONS,
-          pendingUntil,
-          submittedAt,
-        };
-      spendingTracker.transactions.push(tx);
-      agentTransactionsTotal.inc({ status: "pending" });
-      // Append only the new pending transaction — O(1) write (Issue #205)
-      appendTransaction(tx);
-
-      // Notify caregiver that approval is needed (push channel included —
-      // Feature: push notifications).
-      notify({
-        level: "warning",
-        title: "Approval needed: medication payment",
-        description: `$${amount.toFixed(2)} for ${drugName} from ${pharmacyName} exceeds the approval threshold of $${currentPolicy.approvalThreshold}.`,
-        context: { recipientId: currentRecipientId, txId: tx.id, pendingUntil },
-        recipientCaregiverId: "caregiver",
-      });
-
+  // (Issues #209, #1060).
+  const reservation = await updateSpending(
+    {
+      type: "medication",
+      category: TRANSACTION_CATEGORY.MEDICATIONS,
+      description: `${drugName} from ${pharmacyName}`,
+      amount,
+      recipient: pharmacyId,
+    },
+    skipApproval,
+  );
+  if (!reservation.ok) {
+    const { policyCheck, transaction } = reservation;
+    if (reservation.status === "pending") {
       return {
         success: false,
         error: `REQUIRES CAREGIVER APPROVAL: ${amount.toFixed(2)} exceeds the ${currentPolicy.approvalThreshold} approval threshold.`,
@@ -2799,6 +2714,40 @@ export async function payForMedication(
   }
 
   return { success: true, transaction: tx, ...(createdSplit ? { costSplit: createdSplit } : {}) };
+}
+
+// Helper: build, sign, and submit a single USDC payment so payBill can retry on tx_bad_seq
+async function buildAndSubmitUsdcPayment(
+  account: any,
+  recipientKey: string,
+  amount: number,
+): Promise<string> {
+  const usdcAsset = new Asset("USDC", USDC_ISSUER);
+  const stellarTx = new TransactionBuilder(account, {
+    fee: "100",
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(
+      Operation.payment({
+        destination: recipientKey,
+        asset: usdcAsset,
+        amount: amount.toFixed(7),
+      }),
+    )
+    .setTimeout(30)
+    .build();
+  stellarTx.sign(agentKeypair);
+  const sigHint = stellarTx.signatures[0]?.hint();
+  if (!sigHint || !sigHint.equals(agentKeypair.signatureHint())) {
+    throw new Error(
+      `Signer mismatch: expected ${agentKeypair.publicKey()} — refusing to submit`,
+    );
+  }
+  console.log(
+    `  [Stellar] Signer verified: ${agentKeypair.publicKey().slice(0, 8)}...`,
+  );
+  const result = await horizonServer.submitTransaction(stellarTx);
+  return (result as any).hash;
 }
 
 // Helper: build, sign, and submit a single USDC payment so payBill can retry on tx_bad_seq
@@ -3388,6 +3337,7 @@ export function generateDisputeLetter(
       chargedAmount: number;
       suggestedAmount?: number;
       errorDescription?: string;
+      annotation?: string;
     }>;
   },
   recipientInfo: {
@@ -3411,6 +3361,19 @@ export function generateDisputeLetter(
         description: item.description,
       })),
     );
+    if (item.suggestedAmount !== undefined) {
+      letterLines.push(
+        `    Fair market rate: $${item.suggestedAmount.toFixed(2)}`,
+      );
+    }
+    if (item.errorDescription) {
+      letterLines.push(`    Issue: ${item.errorDescription}`);
+    }
+    if (item.annotation) {
+      letterLines.push(`    Caregiver note: ${item.annotation}`);
+    }
+    letterLines.push("");
+  }
 
   const emailBody = formatDisputeLetter({
     billId,
@@ -3497,8 +3460,6 @@ const TOOL_INPUT_SCHEMAS = {
       drug_name: z.string().min(1),
       amount: amountSchema,
       days_supply: amountSchema.optional(),
-      // Optional caregiver memo. Validated to Stellar MEMO_TEXT limit (28 bytes).
-      memo: z.string().max(28).optional(),
       recipient_id: recipientIdSchema,
     })
     .strict(),
@@ -3508,8 +3469,6 @@ const TOOL_INPUT_SCHEMAS = {
       provider_name: z.string().min(1),
       description: z.string().min(1),
       amount: amountSchema,
-      // Optional caregiver memo. Validated to Stellar MEMO_TEXT limit (28 bytes).
-      memo: z.string().max(28).optional(),
       recipient_id: recipientIdSchema,
     })
     .strict(),
@@ -3697,7 +3656,9 @@ export const TOOL_DEFINITIONS = [
     }),
   },
   {
-    description: `Pay a pharmacy for a medication order via MPP Charge on Stellar (real USDC payment). Subject to spending policy limits. Amount must be between $0.01 and $${MAX_PAYMENT}. If the payment is blocked by spending policy, the result includes a budgetContext object { reason, attempted, dailyRemaining, monthlyRemaining, suggestion }: relay it to the caregiver so they can either approve a one-time override or pick a cheaper option within the remaining budget. Optionally supports splitting costs across contributing caregivers.`,
+    name: "pay_for_medication",
+    description:
+      "Pay a pharmacy for a medication order via MPP Charge on Stellar (real USDC payment). Subject to spending policy limits. Amount must be between $0.01 and $10,000. If the payment is blocked by spending policy, the result includes a budgetContext object { reason, attempted, dailyRemaining, monthlyRemaining, suggestion }: relay it to the caregiver so they can either approve a one-time override or pick a cheaper option within the remaining budget.",
     input_schema: strictInputSchema({
       type: "object" as const,
       properties: {
@@ -3732,7 +3693,8 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "pay_bill",
-    description: `Pay a medical bill via direct Stellar USDC transfer. Subject to spending policy limits. If the bill has been audited and errors found, pay only the corrected amount. Amount must be between $0.01 and $${MAX_PAYMENT}. Optionally supports splitting costs across contributing caregivers.`,
+    description:
+      "Pay a medical bill via direct Stellar USDC transfer. Subject to spending policy limits. If the bill has been audited and errors found, pay only the corrected amount. Amount must be between $0.01 and $10,000.",
     input_schema: strictInputSchema({
       type: "object" as const,
       properties: {
@@ -3742,16 +3704,6 @@ export const TOOL_DEFINITIONS = [
         amount: {
           type: "number",
           description: "Payment amount in USD (min: 0.01, max: 10000)",
-        },
-        memo: {
-          type: "string",
-          description:
-            "Optional caregiver memo for personal record-keeping (max 28 bytes, Stellar MEMO_TEXT limit).",
-        },
-        cost_split: {
-          type: "object",
-          description:
-            "Optional cost split across caregivers, e.g. { shares: [{ caregiverId, caregiverName, amount }] }",
         },
         recipient_id: {
           type: "string",
@@ -3831,7 +3783,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: "generate_dispute_letter",
     description:
-      "Generate a dispute letter PDF and email body for a billing error. Use after audit finds overcharges. Letter includes audit findings, CPT codes, fair-market rates, and caregiver contact info.",
+      "Generate a dispute letter PDF and email body for a billing error. Use after audit finds overcharges. Letter includes audit findings, CPT codes, fair-market rates, caregiver contact info, and any caregiver annotations on individual line items (the annotation field on each line item in the audit_result_json).",
     input_schema: strictInputSchema({
       type: "object" as const,
       properties: {

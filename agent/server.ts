@@ -60,6 +60,10 @@ import {
 import { getAdherenceTimeline, getPendingAdherences, skipAdherence } from "../shared/adherence.ts";
 import { createVitalsStore } from "../services/vitals/db.ts";
 import { createVitalsRouter } from "../services/vitals/routes.ts";
+import { getInteractionCheckStore } from "../services/interaction-checks/db.ts";
+import { createInteractionChecksRouter } from "../services/interaction-checks/routes.ts";
+import { getAgentHistoryStore } from "../services/agent-history/db.ts";
+import { createAgentHistoryRouter } from "../services/agent-history/routes.ts";
 import { createCareRecipientsStore } from "../services/care-recipients/db.ts";
 import { authorizeApprovalActor, createDelegationsRouter } from "../services/care-recipients/delegation.ts";
 import { createInsuranceNetworkRouter } from "../services/care-recipients/insurance-network.ts";
@@ -785,6 +789,8 @@ app.post("/agent/adherence/skip", (req, res) => {
 app.use("/agent", createVitalsRouter(createVitalsStore()));
 // #1193: searchable history of past drug interaction checks.
 app.use("/agent", createInteractionChecksRouter(getInteractionCheckStore()));
+// Searchable transcript of agent tool invocations and their outcomes.
+app.use("/agent", createAgentHistoryRouter(getAgentHistoryStore()));
 
 // --- Dispute letter endpoint (#266) ---
 app.post("/agent/dispute-letter", (req, res) => {

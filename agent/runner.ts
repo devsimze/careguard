@@ -53,6 +53,7 @@ import {
   serializeToolResultForPrompt,
 } from "./tool-result.ts";
 import { recordInteractionCheck } from "../services/interaction-checks/db.ts";
+import { recordAgentToolCall } from "../services/agent-history/db.ts";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -566,6 +567,19 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         result = { error: err.message };
         toolCalls.push({ id: toolCall.id, tool: fnName, input: fnArgs, result });
       }
+
+      // Persisted per-recipient transcript for the dashboard's history view.
+      recordAgentToolCall({
+        recipientId:
+          typeof fnArgs?.recipient_id === "string" && fnArgs.recipient_id
+            ? fnArgs.recipient_id
+            : "rosa",
+        runId,
+        task,
+        tool: fnName,
+        input: fnArgs,
+        result,
+      });
 
       appendAuditEntry({
         event: "tool_call",

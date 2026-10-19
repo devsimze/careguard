@@ -27,6 +27,7 @@ import {
   BillLineItemsVirtualized,
   type BillLineItem,
 } from "../primitives/bill-line-items-virtualized";
+import { sanitizeAnnotation } from "../../lib/sanitize";
 import type { AgentResult } from "../types";
 import { getTranslations, type Locale } from "../../i18n";
 import { AGENT_URL } from "../../lib/agent-url";
@@ -60,6 +61,13 @@ function formatTimeAgo(isoDate: string): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
+/**
+ * Per-bill annotation state.
+ * Key: the line-item description (unique within a bill).
+ * Value: sanitized free-text note entered by the caregiver.
+ */
+type BillAnnotations = Record<string, string>;
+
 export function BillsTab({
   agentResult,
   recipient,
@@ -79,6 +87,13 @@ export function BillsTab({
   const [editingAuditKey, setEditingAuditKey] = useState<string | null>(null);
   const [presenceMap, setPresenceMap] = useState<ItemPresenceMap>({});
   const [savingsWindow, setSavingsWindow] = useState<"month" | "year" | "all">("all");
+  /**
+   * Annotations keyed by bill-index so each audit card has its own map.
+   * Structure: { [billIndex]: { [lineItemDescription]: annotationText } }
+   */
+  const [allAnnotations, setAllAnnotations] = useState<
+    Record<number, BillAnnotations>
+  >({});
   const b = getTranslations(locale).bills;
   // #1235: reasoning traces for audits and bill payments from the latest run.
   const reasoning = useActionReasoning(agentResult);
@@ -347,13 +362,27 @@ export function BillsTab({
 
   const auditCallKey = (tc: any) => tc.id ?? `${tc.tool}-${JSON.stringify(tc.input)}`;
 
+  const handleAnnotate = useCallback(
+    (billIndex: number, description: string, raw: string) => {
+      const sanitized = sanitizeAnnotation(raw);
+      setAllAnnotations((prev) => ({
+        ...prev,
+        [billIndex]: {
+          ...(prev[billIndex] ?? {}),
+          [description]: sanitized,
+        },
+      }));
+    },
+    [],
+  );
+
   const handleDispute = useCallback(
-    async (auditResult: any, auditKey: string) => {
+    async (auditResult: any, auditKey: string, annotations: BillAnnotations = {}) => {
       setGeneratingDispute(auditKey);
       try {
         const text =
           customLetterBody[auditKey] ||
-          generateDisputeText(auditResult, recipient, selectedTemplate);
+          generateDisputeText(auditResult, recipient, selectedTemplate, undefined, annotations);
         const letter: DisputeLetter = {
           billId: `bill-${Date.now()}`,
           recipientName: recipient.name,
@@ -361,7 +390,7 @@ export function BillsTab({
           totalOvercharge: auditResult.totalOvercharge,
           errorCount: auditResult.errorCount,
           emailText: text,
-          emailHtml: generateDisputeHtml(auditResult, recipient, selectedTemplate),
+          emailHtml: generateDisputeHtml(auditResult, recipient, selectedTemplate, annotations),
           generatedAt: new Date().toISOString(),
         };
         downloadDisputeLetterPDF(letter);
@@ -374,10 +403,10 @@ export function BillsTab({
   );
 
   const handleDisputeEmail = useCallback(
-    async (auditResult: any, auditKey?: string) => {
+    async (auditResult: any, auditKey?: string, annotations: BillAnnotations = {}) => {
       const text =
         (auditKey && customLetterBody[auditKey]) ||
-        generateDisputeText(auditResult, recipient, selectedTemplate);
+        generateDisputeText(auditResult, recipient, selectedTemplate, undefined, annotations);
       const letter: DisputeLetter = {
         billId: `bill-${Date.now()}`,
         recipientName: recipient.name,
@@ -385,7 +414,7 @@ export function BillsTab({
         totalOvercharge: auditResult.totalOvercharge,
         errorCount: auditResult.errorCount,
         emailText: text,
-        emailHtml: generateDisputeHtml(auditResult, recipient, selectedTemplate),
+        emailHtml: generateDisputeHtml(auditResult, recipient, selectedTemplate, annotations),
         generatedAt: new Date().toISOString(),
       };
       const html = downloadDisputeLetterEmail(letter);
@@ -761,7 +790,10 @@ export function BillsTab({
 
       {/* ── Displayed Audit Results ─────────────────────────────────────────── */}
       {displayedAudits && displayedAudits.length > 0 ? (
-        displayedAudits.map((tc) => {
+        displayedAudits.map((tc, i) => {
+          const annotations = allAnnotations[i] ?? {};
+          const annotatedCount =
+            Object.values(annotations).filter(Boolean).length;
           const visibleLineItems = tc.result.lineItems.filter(
             (item: any) => !showErrorsOnly || item.status !== "valid",
           );
@@ -823,7 +855,7 @@ export function BillsTab({
                           setSelectedTemplate(nextTpl);
                           setCustomLetterBody((prev) => ({
                             ...prev,
-                            [auditCallKey(tc)]: generateDisputeText(tc.result, recipient, nextTpl),
+                            [auditCallKey(tc)]: generateDisputeText(tc.result, recipient, nextTpl, undefined, annotations),
                           }));
                         }}
                         className="text-xs px-2 py-1 border border-slate-300 rounded-lg bg-white text-slate-700 focus:outline-none focus:ring-1 focus:ring-sky-500"
@@ -846,7 +878,7 @@ export function BillsTab({
                             if (!customLetterBody[key]) {
                               setCustomLetterBody((prev) => ({
                                 ...prev,
-                                [key]: generateDisputeText(tc.result, recipient, selectedTemplate),
+                                [key]: generateDisputeText(tc.result, recipient, selectedTemplate, undefined, annotations),
                               }));
                             }
                           }
@@ -857,7 +889,7 @@ export function BillsTab({
                       </button>
 
                       <button
-                        onClick={() => handleDispute(tc.result, auditCallKey(tc))}
+                        onClick={() => handleDispute(tc.result, auditCallKey(tc), annotations)}
                         disabled={generatingDispute === auditCallKey(tc)}
                         className="px-3 py-1.5 bg-red-50 text-red-700 rounded-lg text-xs font-medium hover:bg-red-100 active:bg-red-200 cursor-pointer transition-all disabled:opacity-50"
                       >
@@ -874,7 +906,7 @@ export function BillsTab({
                         )}
                       </button>
                       <button
-                        onClick={() => handleDisputeEmail(tc.result, auditCallKey(tc))}
+                        onClick={() => handleDisputeEmail(tc.result, auditCallKey(tc), annotations)}
                         className="px-3 py-1.5 bg-amber-50 text-amber-700 rounded-lg text-xs font-medium hover:bg-amber-100 active:bg-amber-200 cursor-pointer transition-all"
                       >
                         Email Text
@@ -890,6 +922,11 @@ export function BillsTab({
                   >
                     {tc.result.errorCount} {b.errorsFound}
                   </span>
+                  {annotatedCount > 0 && (
+                    <span className="px-3 py-1 rounded-full text-xs font-medium bg-sky-100 text-sky-700">
+                      {annotatedCount} note{annotatedCount !== 1 ? "s" : ""}
+                    </span>
+                  )}
                 </div>
               </div>
 
@@ -911,7 +948,7 @@ export function BillsTab({
                     rows={8}
                     value={
                       customLetterBody[auditCallKey(tc)] ??
-                      generateDisputeText(tc.result, recipient, selectedTemplate)
+                      generateDisputeText(tc.result, recipient, selectedTemplate, undefined, annotations)
                     }
                     onChange={(e) => {
                       const val = e.target.value;
@@ -1051,7 +1088,11 @@ export function BillsTab({
                 </div>
               </div>
 
-              <BillLineItemsVirtualized lineItems={sortedLineItems} />
+              <BillLineItemsVirtualized
+                lineItems={sortedLineItems}
+                annotations={annotations}
+                onAnnotate={(description, raw) => handleAnnotate(i, description, raw)}
+              />
             </div>
           );
         })
@@ -1096,11 +1137,10 @@ function generateDisputeText(
   recipient: RecipientProfile,
   templateKey?: DisputeReasonTemplate,
   customBody?: string,
+  annotations?: BillAnnotations,
 ): string {
   if (customBody) return customBody;
-  const errorItems = (auditResult.lineItems || []).filter(
-    (item: any) => item.status !== "valid",
-  );
+  const errorItems = withAnnotations(auditResult, annotations);
   const inferred = templateKey || inferDisputeTemplate(errorItems);
   return formatDisputeLetter({
     billId: auditResult.billId || `bill-${Date.now()}`,
@@ -1120,10 +1160,9 @@ function generateDisputeHtml(
   auditResult: any,
   recipient: RecipientProfile,
   templateKey?: DisputeReasonTemplate,
+  annotations?: BillAnnotations,
 ): string {
-  const errorItems = (auditResult.lineItems || []).filter(
-    (item: any) => item.status !== "valid",
-  );
+  const errorItems = withAnnotations(auditResult, annotations);
   const inferred = templateKey || inferDisputeTemplate(errorItems);
   return formatDisputeHtml({
     billId: auditResult.billId || `bill-${Date.now()}`,
@@ -1137,4 +1176,19 @@ function generateDisputeHtml(
     disputedItems: errorItems,
     totalOvercharge: auditResult.totalOvercharge,
   });
+}
+
+/** Audit findings plus any caregiver notes recorded on this run. */
+function withAnnotations(
+  auditResult: any,
+  annotations?: BillAnnotations,
+): any[] {
+  const errorItems = (auditResult.lineItems || []).filter(
+    (item: any) => item.status !== "valid",
+  );
+  if (!annotations) return errorItems;
+  return errorItems.map((item: any) => ({
+    ...item,
+    annotation: annotations[item.description] ?? item.annotation,
+  }));
 }

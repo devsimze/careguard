@@ -1,13 +1,14 @@
 "use client";
 
-import { useState, useMemo } from "react";
-import { downloadTransactionPDF, downloadAuditLogPDF } from "../../app/pdf";
+import { useState, useMemo, useCallback } from "react";
+import { downloadTransactionPDF } from "../../app/pdf";
 import { copyText } from "../../lib/clipboard";
 import type { RecipientProfile } from "../../lib/types";
 import { ConfirmDialog } from "../primitives/confirm-dialog";
 import { TxLink } from "../primitives/tx-link";
 import { useActionReasoning, WhyDidThisHappen } from "../why-did-this-happen";
 import { formatTime, getTranslations, type Locale } from "../../i18n";
+import { sanitizeUserString } from "../../lib/sanitize";
 import type {
   AgentLogEntry,
   PaginationData,
@@ -98,6 +99,56 @@ function StatusBadge({ status, reason }: { status: string; reason?: string }) {
   );
 }
 
+/** Tags keyed by transaction id. Each tx can have multiple tags. */
+type TxTagsMap = Record<string, string[]>;
+
+const PRESET_TAGS = [
+  "reimbursable",
+  "urgent care",
+  "review",
+  "disputed",
+  "personal",
+];
+
+function exportCsvWithTags(
+  transactions: Transaction[],
+  tagsMap: TxTagsMap,
+): void {
+  const header = [
+    "ID",
+    "Timestamp",
+    "Type",
+    "Description",
+    "Amount",
+    "Status",
+    "Category",
+    "Stellar Tx",
+    "Tags",
+  ];
+  const rows = transactions.map((tx) => {
+    const tags = (tagsMap[tx.id] ?? []).join("|");
+    return [
+      tx.id,
+      tx.timestamp,
+      tx.type,
+      `"${tx.description.replace(/"/g, '""')}"`,
+      tx.amount.toFixed(2),
+      tx.status,
+      tx.category,
+      tx.stellarTxHash ?? "",
+      tags,
+    ].join(",");
+  });
+  const csv = [header.join(","), ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `careguard-transactions-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export function ActivityTab({
   recipient,
   agentLog,
@@ -154,9 +205,44 @@ export function ActivityTab({
     }
   };
 
+  // Tags state: { [txId]: string[] }
+  const [tagsMap, setTagsMap] = useState<TxTagsMap>({});
+  // Per-tx tag input state
+  const [tagInputs, setTagInputs] = useState<Record<string, string>>({});
+
+  // Search / filter state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
+
+  // Collect all unique tags across all transactions for the filter chip bar
+  const allUsedTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const tags of Object.values(tagsMap) as string[][]) {
+      for (const t of tags) set.add(t);
+    }
+    return Array.from(set).sort();
+  }, [tagsMap]);
+
+  const addTag = useCallback((txId: string, raw: string) => {
+    const tag = sanitizeUserString(raw).toLowerCase().trim();
+    if (!tag) return;
+    setTagsMap((prev) => {
+      const existing = prev[txId] ?? [];
+      if (existing.includes(tag)) return prev;
+      return { ...prev, [txId]: [...existing, tag] };
+    });
+    setTagInputs((prev) => ({ ...prev, [txId]: "" }));
+  }, []);
+
+  const removeTag = useCallback((txId: string, tag: string) => {
+    setTagsMap((prev) => {
+      const existing = prev[txId] ?? [];
+      const next = existing.filter((t) => t !== tag);
+      return { ...prev, [txId]: next };
+    });
+  }, []);
+
   // allTransactions arrives pre-sorted newest-first from fetchTransactions (#220).
-  // useMemo ensures the merge only reruns when transactions or audit events change,
-  // not on unrelated parent state changes (agentLog, loading flags, etc.).
   const mergedTimeline = useMemo(() => {
     type TimelineItem = {
       ts: number;
@@ -176,9 +262,6 @@ export function ActivityTab({
       id: `audit-${au.timestamp}-${au.event}`,
       data: au,
     }));
-    // Merge the two newest-first sequences. txItems is guaranteed pre-sorted;
-    // auditItems are sorted here. A linear merge keeps this O(n) when both
-    // inputs are already ordered.
     auditItems.sort((a, b) => b.ts - a.ts);
     const merged: TimelineItem[] = [];
     let ti = 0,
@@ -191,6 +274,30 @@ export function ActivityTab({
     while (ai < auditItems.length) merged.push(auditItems[ai++]);
     return merged;
   }, [allTransactions, auditEvents]);
+
+  // Apply search + tag filter
+  const filteredTimeline = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return mergedTimeline.filter((item) => {
+      if (item.kind === "audit") {
+        // Audit rows are not tagged/searched — keep them only when no filters are active
+        return !q && !activeTagFilter;
+      }
+      const tx = item.data as Transaction;
+      const txTags = tagsMap[tx.id] ?? [];
+
+      if (activeTagFilter && !txTags.includes(activeTagFilter)) return false;
+
+      if (q) {
+        const descMatch = tx.description.toLowerCase().includes(q);
+        const amtMatch = tx.amount.toFixed(2).includes(q);
+        const tagMatch = txTags.some((t) => t.includes(q));
+        if (!descMatch && !amtMatch && !tagMatch) return false;
+      }
+
+      return true;
+    });
+  }, [mergedTimeline, searchQuery, activeTagFilter, tagsMap]);
 
   return (
     <div
@@ -214,20 +321,32 @@ export function ActivityTab({
           onResetAgent();
         }}
       />
-      <div className="flex items-center justify-between">
+
+      {/* Toolbar */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <h2 className="text-sm font-semibold text-slate-700">
           Transaction Log
         </h2>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
           {allTransactions.length > 0 && (
-            <button
-              onClick={handleDownloadReport}
-              disabled={preparingReport}
-              aria-busy={preparingReport}
-              className="px-3 py-1.5 bg-sky-50 text-sky-700 rounded-lg text-xs font-medium hover:bg-sky-100 active:bg-sky-200 cursor-pointer transition-all disabled:opacity-60 disabled:cursor-not-allowed"
-            >
-              {preparingReport ? t.preparingReport : t.downloadReport}
-            </button>
+            <>
+              <button
+                onClick={() =>
+                  downloadTransactionPDF(allTransactions, spending, {
+                    recipient,
+                  })
+                }
+                className="px-3 py-1.5 bg-sky-50 text-sky-700 rounded-lg text-xs font-medium hover:bg-sky-100 active:bg-sky-200 cursor-pointer transition-all"
+              >
+                Download PDF
+              </button>
+              <button
+                onClick={() => exportCsvWithTags(allTransactions, tagsMap)}
+                className="px-3 py-1.5 bg-emerald-50 text-emerald-700 rounded-lg text-xs font-medium hover:bg-emerald-100 active:bg-emerald-200 cursor-pointer transition-all"
+              >
+                Export CSV
+              </button>
+            </>
           )}
           {allTransactions.length > 0 && (
             <button
@@ -289,6 +408,8 @@ export function ActivityTab({
           </button>
         </div>
       </div>
+
+      {/* Agent log terminal */}
       <div
         className="bg-white rounded-xl border border-slate-200 p-4 text-xs text-slate-700 max-h-48 overflow-y-auto"
         aria-live="polite"
@@ -372,10 +493,83 @@ export function ActivityTab({
             .join("\n")}
         </div>
       </div>
+
+      {/* Search & tag filters */}
+      <div className="space-y-2">
+        <div className="relative">
+          <input
+            type="search"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search by description, tag, or amount…"
+            aria-label="Search transactions"
+            className="w-full pl-8 pr-3 py-2 border border-slate-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-sky-500 bg-white"
+          />
+          <svg
+            className="absolute left-2.5 top-2.5 w-3.5 h-3.5 text-slate-400 pointer-events-none"
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            strokeWidth={2}
+            aria-hidden="true"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z"
+            />
+          </svg>
+        </div>
+
+        {/* Tag filter chips */}
+        {allUsedTags.length > 0 && (
+          <div
+            className="flex flex-wrap gap-1.5 items-center"
+            aria-label="Filter by tag"
+          >
+            <span className="text-xs text-slate-400">Filter:</span>
+            {allUsedTags.map((tag) => (
+              <button
+                key={tag}
+                onClick={() =>
+                  setActiveTagFilter((prev) => (prev === tag ? null : tag))
+                }
+                className={`px-2 py-0.5 rounded-full text-xs font-medium border transition-colors cursor-pointer ${
+                  activeTagFilter === tag
+                    ? "bg-sky-500 text-white border-sky-500"
+                    : "bg-white text-slate-600 border-slate-300 hover:bg-slate-100"
+                }`}
+              >
+                {tag}
+              </button>
+            ))}
+            {activeTagFilter && (
+              <button
+                onClick={() => setActiveTagFilter(null)}
+                className="text-xs text-slate-400 hover:text-slate-600 underline"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+
+        {(searchQuery || activeTagFilter) && (
+          <p className="text-xs text-slate-500">
+            Showing {filteredTimeline.filter((i) => i.kind === "tx").length} of{" "}
+            {allTransactions.length} transactions
+          </p>
+        )}
+      </div>
+
+      {/* Transactions table */}
       <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-        {mergedTimeline.length === 0 && !pagination ? (
+        {filteredTimeline.length === 0 && !pagination ? (
           <div className="p-8 text-center text-sm text-slate-400">
-            {t.noTransactions}
+            {searchQuery || activeTagFilter
+              ? "No transactions match your search."
+              : "No activity yet"}
           </div>
         ) : (
           <>
@@ -463,10 +657,13 @@ export function ActivityTab({
                     <th className="text-right px-4 py-2 text-xs font-medium text-slate-500">
                       {t.stellarTx}
                     </th>
+                    <th className="text-left px-4 py-2 text-xs font-medium text-slate-500">
+                      Tags
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {mergedTimeline.map((item) => {
+                  {filteredTimeline.map((item) => {
                     if (item.kind === "audit") {
                       const au = item.data as AuditLogEvent;
                       return (
@@ -488,13 +685,9 @@ export function ActivityTab({
                             </span>
                             {au.details?.tool && (
                               <span className="text-slate-500 ml-1">
-                                — Tool: {au.details.tool}
+                                — Tool: {String(au.details.tool)}
                               </span>
                             )}
-                          </td>
-                          {/* memo column — empty for audit rows */}
-                          <td className="hidden lg:table-cell px-4 py-2 text-xs text-slate-400">
-                            -
                           </td>
                           <td className="px-4 py-2 text-right text-xs font-mono text-slate-400">
                             -
@@ -502,17 +695,18 @@ export function ActivityTab({
                           <td className="px-4 py-2 text-right text-xs text-slate-500">
                             {au.actor}
                           </td>
-                          {/* order status column — empty for audit rows */}
-                          <td className="hidden sm:table-cell px-4 py-2 text-right text-xs text-slate-400">
-                            -
-                          </td>
                           <td className="px-4 py-2 text-right text-xs text-slate-400">
                             -
                           </td>
+                          <td className="px-4 py-2" />
                         </tr>
                       );
                     }
+
                     const tx = item.data as Transaction;
+                    const txTags = tagsMap[tx.id] ?? [];
+                    const inputVal = tagInputs[tx.id] ?? "";
+
                     return (
                       <tr
                         key={tx.id}
@@ -586,6 +780,55 @@ export function ActivityTab({
                             txHashStatus={tx.txHashStatus}
                           />
                         </td>
+                        {/* Tags cell */}
+                        <td className="px-4 py-2">
+                          <div className="flex flex-wrap gap-1 items-center min-w-[160px]">
+                            {txTags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-sky-100 text-sky-700"
+                              >
+                                {tag}
+                                <button
+                                  onClick={() => removeTag(tx.id, tag)}
+                                  aria-label={`Remove tag ${tag}`}
+                                  className="hover:text-sky-900 cursor-pointer leading-none"
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            ))}
+                            {/* Tag input */}
+                            <form
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                addTag(tx.id, inputVal);
+                              }}
+                              className="flex items-center gap-1"
+                            >
+                              <input
+                                type="text"
+                                maxLength={40}
+                                value={inputVal}
+                                onChange={(e) =>
+                                  setTagInputs((prev) => ({
+                                    ...prev,
+                                    [tx.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="+ tag"
+                                aria-label={`Add tag to ${tx.description}`}
+                                list={`presets-${tx.id}`}
+                                className="w-20 text-[10px] px-1.5 py-0.5 border border-slate-200 rounded focus:outline-none focus:ring-1 focus:ring-sky-400 bg-white"
+                              />
+                              <datalist id={`presets-${tx.id}`}>
+                                {PRESET_TAGS.map((p) => (
+                                  <option key={p} value={p} />
+                                ))}
+                              </datalist>
+                            </form>
+                          </div>
+                        </td>
                       </tr>
                     );
                   })}
@@ -595,6 +838,7 @@ export function ActivityTab({
           </>
         )}
       </div>
+      <AgentHistorySection />
     </div>
   );
 }
