@@ -31,11 +31,10 @@ check the limit that actually applies," below). Source of truth:
 
 > **Note on `/pharmacy/order`:** this table describes the route as mounted
 > on the unified server (`server.ts`), which is the endpoint documented in
-> [`docs/openapi.yml`](../openapi.yml). If you are instead calling the
-> standalone pharmacy-payment service directly
-> ([`services/pharmacy-payment/server.ts`](../../services/pharmacy-payment/server.ts))
-> on its own port, no rate limiter is currently applied there — do not
-> assume the same protection exists on both paths.
+> [`docs/openapi.yml`](../openapi.yml). The standalone pharmacy-payment
+> service applies the same `pharmacy_order` policy on its direct port
+> as well, so both paths enforce the same quota and `Retry-After`
+> behavior.
 
 ---
 
