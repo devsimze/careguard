@@ -24,9 +24,20 @@ import { requestLifecycleMiddleware } from "../../shared/request-lifecycle.ts";
 import { gracefulShutdown } from "../../shared/graceful-shutdown.ts";
 import { sanitizeUserString } from "../../shared/sanitize.ts";
 import {
+  concurrentRequestsMiddleware,
+  perRouteLimiters,
+} from "../../shared/rate-limit.ts";
+import {
   MedicationOrderSchema,
   type MedicationOrderInput,
 } from "./validation.ts";
+import {
+  metricsHandler,
+  pharmacyPaymentOrdersTotal,
+  pharmacyMppChargesTotal,
+  paymentsUsdcTotal,
+  stellarTxSubmittedTotal,
+} from "../../shared/metrics.ts";
 
 const PORT = parseInt(process.env.PHARMACY_PAYMENT_PORT || "3005", 10);
 const RECIPIENT = process.env.PHARMACY_1_PUBLIC_KEY;
@@ -126,6 +137,9 @@ app.get("/pharmacy/orders", (_req, res) => {
   res.json({ orders: loadOrders() });
 });
 
+// GET /metrics endpoint for Prometheus instrumentation (Issue #1015)
+app.get("/metrics", metricsHandler());
+
 // MPP charge server
 const mppx = Mppx.create({
   secretKey: MPP_SECRET_KEY,
@@ -140,88 +154,93 @@ const mppx = Mppx.create({
 });
 
 // MPP-protected medication order endpoint
-app.post("/pharmacy/order", async (req, res) => {
-  const parsedOrder = MedicationOrderSchema.safeParse(req.body);
-  if (!parsedOrder.success) {
-    res.status(400).json({
-      error: "Invalid order request",
-      details: parsedOrder.error.issues.map((issue) => issue.message),
-    });
-    return;
-  }
-
-  const order = parsedOrder.data as MedicationOrderInput;
-  const safeDrug = sanitizeUserString(order.drug);
-  const safePharmacy = sanitizeUserString(order.pharmacy);
-
-  // Convert Express request to Web Request for mppx. Never forward the
-  // caller's own auth/session headers into the upstream MPP charge call —
-  // mppx only needs the payment-protocol headers (e.g. X-Payment).
-  const FORWARD_HEADER_BLOCKLIST = new Set(["authorization", "cookie"]);
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (value == null) continue;
-    if (FORWARD_HEADER_BLOCKLIST.has(key.toLowerCase())) continue;
-    if (Array.isArray(value)) {
-      for (const entry of value) headers.append(key, entry);
-    } else {
-      headers.set(key, value);
+app.post(
+  "/pharmacy/order",
+  perRouteLimiters.pharmacyOrder,
+  concurrentRequestsMiddleware("pharmacy_order"),
+  async (req, res) => {
+    const parsedOrder = MedicationOrderSchema.safeParse(req.body);
+    if (!parsedOrder.success) {
+      res.status(400).json({
+        error: "Invalid order request",
+        details: parsedOrder.error.issues.map((issue) => issue.message),
+      });
+      return;
     }
-  }
 
-  const webReq = new Request(`http://localhost:${PORT}${req.url}`, {
-    method: req.method,
-    headers,
-  });
+    const order = parsedOrder.data as MedicationOrderInput;
+    const safeDrug = sanitizeUserString(order.drug);
+    const safePharmacy = sanitizeUserString(order.pharmacy);
 
-  // Run MPP charge flow
-  let result;
-  try {
-    result = await mppx.charge({
-      amount: Number(order.amount).toFixed(2),
-      description: `Medication: ${safeDrug} from ${safePharmacy}`,
-    })(webReq);
-  } catch (err: any) {
-    logger.error({ err: err?.message }, "MPP charge flow failed — facilitator unavailable");
-    res.status(503).json({ error: "Payment facilitator unavailable, try again shortly" });
-    return;
-  }
+    // Convert Express request to Web Request for mppx. Never forward the
+    // caller's own auth/session headers into the upstream MPP charge call —
+    // mppx only needs the payment-protocol headers (e.g. X-Payment).
+    const FORWARD_HEADER_BLOCKLIST = new Set(["authorization", "cookie"]);
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (value == null) continue;
+      if (FORWARD_HEADER_BLOCKLIST.has(key.toLowerCase())) continue;
+      if (Array.isArray(value)) {
+        for (const entry of value) headers.append(key, entry);
+      } else {
+        headers.set(key, value);
+      }
+    }
 
-  // 402 = client needs to sign and pay
-  if (result.status === 402) {
-    const challenge = result.challenge;
-    challenge.headers.forEach((value: string, key: string) => res.setHeader(key, value));
-    const body = await challenge.text();
-    res.status(402).send(body);
-    return;
-  }
+    const webReq = new Request(`http://localhost:${PORT}${req.url}`, {
+      method: req.method,
+      headers,
+    });
 
-  // Payment verified and settled on Stellar — create order
-  const newOrder = {
-    id: `order-${Date.now()}`,
-    drug: safeDrug,
-    pharmacy: safePharmacy,
-    amount: Number(order.amount),
-    status: "confirmed",
-    timestamp: new Date().toISOString(),
-    network: NETWORK,
-    protocol: "MPP Charge",
-  };
-  await saveOrder(newOrder);
+    // Run MPP charge flow
+    let result;
+    try {
+      result = await mppx.charge({
+        amount: Number(order.amount).toFixed(2),
+        description: `Medication: ${safeDrug} from ${safePharmacy}`,
+      })(webReq);
+    } catch (err: any) {
+      logger.error({ err: err?.message }, "MPP charge flow failed — facilitator unavailable");
+      res.status(503).json({ error: "Payment facilitator unavailable, try again shortly" });
+      return;
+    }
 
-  // Return response with payment receipt headers
-  const response = result.withReceipt(
-    Response.json({
-      success: true,
-      order: newOrder,
-      message: `Payment of $${newOrder.amount} USDC settled on Stellar. ${safeDrug} order from ${safePharmacy} confirmed.`,
-    })
-  );
+    // 402 = client needs to sign and pay
+    if (result.status === 402) {
+      const challenge = result.challenge;
+      challenge.headers.forEach((value: string, key: string) => res.setHeader(key, value));
+      const body = await challenge.text();
+      res.status(402).send(body);
+      return;
+    }
 
-  response.headers.forEach((value: string, key: string) => res.setHeader(key, value));
-  const responseBody = await response.json();
-  res.status(response.status).json(responseBody);
-});
+    // Payment verified and settled on Stellar — create order
+    const newOrder = {
+      id: `order-${Date.now()}`,
+      drug: safeDrug,
+      pharmacy: safePharmacy,
+      amount: Number(order.amount),
+      status: "confirmed",
+      timestamp: new Date().toISOString(),
+      network: NETWORK,
+      protocol: "MPP Charge",
+    };
+    await saveOrder(newOrder);
+
+    // Return response with payment receipt headers
+    const response = result.withReceipt(
+      Response.json({
+        success: true,
+        order: newOrder,
+        message: `Payment of $${newOrder.amount} USDC settled on Stellar. ${safeDrug} order from ${safePharmacy} confirmed.`,
+      })
+    );
+
+    response.headers.forEach((value: string, key: string) => res.setHeader(key, value));
+    const responseBody = await response.json();
+    res.status(response.status).json(responseBody);
+  },
+);
 
 app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (err.type === "entity.too.large") {

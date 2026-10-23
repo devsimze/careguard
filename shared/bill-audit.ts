@@ -255,6 +255,10 @@ export function auditBill(lineItems: any[], options: AuditBillOptions = {}) {
           },
         }
       : null;
+  const baseRecommendation =
+    errorCount === 0
+      ? "No errors detected. This bill appears correct."
+      : `Found ${errorCount} errors totaling $${totalOvercharge} in overcharges (${savingsPercent}% of total bill). Strongly recommend filing a formal dispute.`;
 
   return {
     auditTimestamp: new Date().toISOString(),
@@ -265,10 +269,11 @@ export function auditBill(lineItems: any[], options: AuditBillOptions = {}) {
     savingsPercent,
     errorCount,
     lineItems: results,
+    isStale,
     dataFreshness: { ratesAsOf, validUntil: ratesValidUntil, isStale },
     comparisonBasis,
-    recommendation: errorCount === 0
-      ? "No errors detected. This bill appears correct."
-      : `Found ${errorCount} errors totaling $${totalOvercharge} in overcharges (${savingsPercent}% of total bill). Strongly recommend filing a formal dispute.`,
+    recommendation: isStale
+      ? `${baseRecommendation} Warning: the fair-market rates used are stale (valid through ${ratesValidUntil}). Verify against current rates.`
+      : baseRecommendation,
   };
 }

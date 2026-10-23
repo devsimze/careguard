@@ -16,6 +16,7 @@ import { buildActionReasonings } from "../shared/action-reasoning.ts";
 import { recordActionReasoning } from "../shared/agent-state.ts";
 import {
   agentToolCallsTotal,
+  agentToolCallCapExceededTotal,
   agentLlmTokensTotal,
   agentLlmIterationTokens,
   agentLlmContextUsageRatio,
@@ -312,10 +313,10 @@ export async function executeTool(
         break;
       }
       case "get_adherence_status":
-        result = getAdherenceStatus(rid);
+        result = await getAdherenceStatus(rid);
         break;
       case "confirm_adherence":
-        result = confirmAdherenceReminder(input.record_id as string);
+        result = await confirmAdherenceReminder(input.record_id as string);
         break;
       case "get_handoff_notes":
         result = getHandoffNotes(
@@ -519,7 +520,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     if (runToolCalls + message.tool_calls.length > maxToolCallsPerRun) {
       truncated = true;
       events.push({ kind: "tool_call_cap_reached" });
-      appendAuditEntry({
+      await appendAuditEntry({
         event: "agent.tool_cap_exceeded",
         actor: "agent",
         details: { max: maxToolCallsPerRun, ran: runToolCalls },
@@ -568,20 +569,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
         toolCalls.push({ id: toolCall.id, tool: fnName, input: fnArgs, result });
       }
 
-      // Persisted per-recipient transcript for the dashboard's history view.
-      recordAgentToolCall({
-        recipientId:
-          typeof fnArgs?.recipient_id === "string" && fnArgs.recipient_id
-            ? fnArgs.recipient_id
-            : "rosa",
-        runId,
-        task,
-        tool: fnName,
-        input: fnArgs,
-        result,
-      });
-
-      appendAuditEntry({
+      await appendAuditEntry({
         event: "tool_call",
         actor: "agent",
         details: {
@@ -608,7 +596,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<RunAgentResult> {
     truncated = true;
     events.push({ kind: "iteration_limit_reached" });
     agentIterationLimitTotal.inc();
-    appendAuditEntry({
+    await appendAuditEntry({
       event: "agent.iteration_limit_reached",
       actor: "agent",
       details: { maxIterations, toolCallCount: toolCalls.length },

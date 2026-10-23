@@ -129,33 +129,6 @@ export interface SideEffectEntry {
   timestamp: string;
 }
 
-export type SeverityThreshold = 'any' | 'major' | 'moderate' | 'mild';
-
-export interface SpendingPolicy {
-  dailyLimit: number;
-  monthlyLimit: number;
-  medicationMonthlyBudget: number;
-  billMonthlyBudget: number;
-  approvalThreshold: number; // require caregiver approval above this amount
-  holdTimeSeconds: number; // time before pending approvals auto-approve
-  severityThreshold?: SeverityThreshold;
-  /**
-   * IANA timezone string for the caregiver's local day (Issue #207).
-   * Example: "America/Phoenix", "America/New_York", "Europe/London".
-   * When set, daily-limit checks use this timezone to determine "today"
-   * rather than UTC or the global SPENDING_TIMEZONE env var.
-   * Defaults to the SPENDING_TIMEZONE env var if omitted.
-   */
-  timezone?: string;
-  toolFees?: Record<string, number>; // per-tool query fees (e.g., comparePharmacyPrices: 0.002)
-  notifications?: {
-    email: boolean;
-    sms: boolean;
-    emailAddress?: string;
-    phoneNumber?: string;
-  };
-}
-
 // A confirmed Stellar transaction hash is always 64 lowercase/uppercase hex chars.
 export const STELLAR_TX_HASH_RE = /^[0-9a-f]{64}$/i;
 
@@ -408,6 +381,7 @@ export const SpendingPolicySchema = z
       .gt(0, "approvalThreshold must be greater than 0")
       .max(10_000, "approvalThreshold cannot exceed $10,000"),
     holdTimeSeconds: z.number().int("holdTimeSeconds must be an integer").min(0).max(86_400).default(0),
+    severityThreshold: z.enum(['any', 'major', 'moderate', 'mild']).optional(),
     /**
      * IANA timezone string for the caregiver's local day (Issue #207).
      * Example: "America/Phoenix", "America/New_York", "Europe/London".

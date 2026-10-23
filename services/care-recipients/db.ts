@@ -541,14 +541,6 @@ export class CareRecipientsStore {
     return row ? rowToTask(row) : undefined;
   }
 
-  listSideEffectEntries(recipientId: string, medicationId?: string): SideEffectEntry[] {
-    const sql = medicationId
-      ? 'SELECT * FROM side_effect_entries WHERE recipient_id = ? AND medication_id = ? ORDER BY timestamp DESC'
-      : 'SELECT * FROM side_effect_entries WHERE recipient_id = ? ORDER BY timestamp DESC';
-    const params = medicationId ? [recipientId, medicationId] : [recipientId];
-    return this.db.prepare(sql).all(...params) as SideEffectEntry[];
-  }
-
   // ── Caregiver links (#1179) ─────────────────────────────────────────────────
 
   /** Active caregivers and pending invites for a recipient, oldest first. */
@@ -768,6 +760,16 @@ export class CareRecipientsStore {
       WHERE id = ? AND delegator = ? AND revoked_at IS NULL AND ends_at > ?
     `).run(now.toISOString(), id, delegator, now.toISOString());
     return result.changes > 0 ? this.getDelegation(id) : undefined;
+  }
+
+  // ── Side effects ─────────────────────────────────────────────────────────
+
+  listSideEffectEntries(recipientId: string, medicationId?: string): SideEffectEntry[] {
+    const sql = medicationId
+      ? 'SELECT * FROM side_effect_entries WHERE recipient_id = ? AND medication_id = ? ORDER BY timestamp DESC'
+      : 'SELECT * FROM side_effect_entries WHERE recipient_id = ? ORDER BY timestamp DESC';
+    const params = medicationId ? [recipientId, medicationId] : [recipientId];
+    return this.db.prepare(sql).all(...params) as SideEffectEntry[];
   }
 
   addSideEffectEntry(entry: Omit<SideEffectEntry, 'id'>): SideEffectEntry {

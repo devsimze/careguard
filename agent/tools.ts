@@ -622,14 +622,18 @@ const DEFAULT_POLICY: SpendingPolicy = {
   notifications: { email: false, sms: false },
 };
 
-// Helper: Get tool fee from policy, throw if not configured
-function getToolFee(toolName: string): number {
+/** Default x402 service fee (USDC) used when a policy omits a tool fee. */
+const DEFAULT_TOOL_FEE_USDC = 0.001;
+
+export function getToolFee(toolName: string): number {
   const policy = loadPolicy();
   const fee = policy.toolFees?.[toolName];
   if (fee === undefined || fee === null) {
-    throw new Error(
-      `Tool fee not configured for ${toolName}. Please add it to policy.toolFees in the spending policy.`,
+    logger.warn(
+      { toolName, fallbackFee: DEFAULT_TOOL_FEE_USDC },
+      "Tool fee not configured; using the default x402 service fee",
     );
+    return DEFAULT_TOOL_FEE_USDC;
   }
   return fee;
 }
@@ -670,16 +674,29 @@ function getDisputesFile(recipientId?: string): string {
 }
 
 // Migrate legacy flat files to per-recipient structure (one-time)
+const LEGACY_MIGRATION_COMPLETE = Symbol.for(
+  "careguard.legacyDataMigrationComplete",
+);
+
 function migrateLegacyData() {
+  if (Reflect.get(globalThis, LEGACY_MIGRATION_COMPLETE) === true) return;
+
   const legacySpending = `${getDataDir()}/spending.json`;
   const legacyOrders = `${getDataDir()}/orders.json`;
+  const hasLegacySpending = existsSync(legacySpending);
+  const hasLegacyOrders = existsSync(legacyOrders);
+  if (!hasLegacySpending && !hasLegacyOrders) {
+    Reflect.set(globalThis, LEGACY_MIGRATION_COMPLETE, true);
+    return;
+  }
+
   const rosaDir = getRecipientDir("rosa");
   if (!existsSync(rosaDir)) mkdirSync(rosaDir, { recursive: true });
-  if (existsSync(legacySpending) && !existsSync(`${rosaDir}/spending.json`)) {
+  if (hasLegacySpending && !existsSync(`${rosaDir}/spending.json`)) {
     const data = readFileSync(legacySpending, "utf-8");
     writeFileSync(`${rosaDir}/spending.json`, data);
   }
-  if (existsSync(legacyOrders) && !existsSync(`${rosaDir}/orders.json`)) {
+  if (hasLegacyOrders && !existsSync(`${rosaDir}/orders.json`)) {
     const data = readFileSync(legacyOrders, "utf-8");
     writeFileSync(`${rosaDir}/orders.json`, data);
   }
@@ -689,6 +706,7 @@ function migrateLegacyData() {
       JSON.stringify(DEFAULT_POLICY, null, 2),
     );
   }
+  Reflect.set(globalThis, LEGACY_MIGRATION_COMPLETE, true);
 }
 migrateLegacyData();
 
@@ -1344,20 +1362,23 @@ function loadPolicy(recipientId?: string): SpendingPolicy {
   const file = getPolicyFile(recipientId);
   if (!existsSync(file)) return { ...DEFAULT_POLICY };
   try {
-    const parsed = JSON.parse(readFileSync(file, 'utf-8')) as SpendingPolicy;
-    return {
-      ...DEFAULT_POLICY,
-      ...parsed,
-      notifications: {
-        ...DEFAULT_POLICY.notifications,
-        ...(parsed.notifications || {}),
-      },
-    };
+    const parsed = JSON.parse(readFileSync(file, "utf-8"));
+    const validated = SpendingPolicySchema.safeParse(parsed);
+    if (!validated.success) {
+      logger.warn(
+        { file, errors: validated.error.issues },
+        "[Persistence] policy.json schema invalid",
+      );
+      rotateCorruptedFile(file);
+      return { ...DEFAULT_POLICY };
+    }
+    return validated.data;
   } catch (err: any) {
     logger.warn(
       { file, error: err.message },
       "[Persistence] policy.json is corrupted; falling back to the default policy",
     );
+    rotateCorruptedFile(file);
     return { ...DEFAULT_POLICY };
   }
 }
@@ -1409,7 +1430,7 @@ function buildGenericAlternatives(drugName: string) {
 }
 
 function savePolicy(policy: SpendingPolicy, recipientId?: string) {
-  writeFileSync(getPolicyFile(recipientId), JSON.stringify(policy, null, 2));
+  writeAtomically(getPolicyFile(recipientId), JSON.stringify(policy, null, 2));
 }
 
 function assertValidSpendingPolicy(policy: SpendingPolicy) {
@@ -2564,6 +2585,36 @@ export async function payForMedication(
       error: `BLOCKED BY PLATFORM CAP: $${amount.toFixed(2)} exceeds MAX_SINGLE_TX_USDC ($${getPlatformTxCap().toFixed(2)})`,
     };
   }
+
+  // Check recipient allergies (Issue #1230)
+  const allergyCheck = checkMedicationAllergies(drugName, targetRecipientId);
+  if (allergyCheck.blocked) {
+    const primaryConflict = allergyCheck.conflicts.find(
+      (c) => c.severity === "severe" || c.severity === "life_threatening",
+    );
+    logger.warn(
+      { drugName, recipientId: targetRecipientId, conflict: primaryConflict },
+      "[allergy-check] payment blocked due to severe allergy contraindication",
+    );
+    return {
+      success: false,
+      blocked: true,
+      reason: "ALLERGY_CONTRAINDICATION",
+      error: `BLOCKED BY ALLERGY GUARD: Patient has documented ${primaryConflict?.severity.replace("_", "-")} allergy to ${primaryConflict?.allergy.substance}. Cannot order ${drugName}.`,
+      conflicts: allergyCheck.conflicts,
+    };
+  }
+  // Validate optional memo: Stellar MEMO_TEXT is limited to 28 bytes.
+  if (memo !== undefined) {
+    const memoBytes = Buffer.byteLength(memo, "utf8");
+    if (memoBytes > STELLAR_MEMO_TEXT_MAX_BYTES) {
+      return {
+        success: false,
+        error: `Memo too long: ${memoBytes} bytes. Maximum is ${STELLAR_MEMO_TEXT_MAX_BYTES} bytes for Stellar MEMO_TEXT.`,
+      };
+    }
+  }
+
   // Atomically check policy and reserve the budget before the async payment
   // (Issues #209, #1060).
   const reservation = await updateSpending(
@@ -2582,39 +2633,15 @@ export async function payForMedication(
       return {
         success: false,
         error: `REQUIRES CAREGIVER APPROVAL: ${amount.toFixed(2)} exceeds the ${currentPolicy.approvalThreshold} approval threshold.`,
-        transaction,
+        transaction: tx,
       };
     }
 
-    const reason = policyCheck.reason!.includes("daily")
-      ? "daily_limit"
-      : policyCheck.reason!.includes("overall monthly limit")
-        ? "monthly_limit"
-        : "budget";
-    policyBlocksTotal.inc({ reason });
-    paymentRejectedTotal.inc({ reason });
-
-    // Surface the full budget context so the LLM can decide whether to ask
-    // the caregiver for an override or pick a cheaper option (Issue #160).
-    const dailyRemaining = policyCheck.dailyRemaining ?? 0;
-    const monthlyRemaining = policyCheck.monthlyRemaining ?? 0;
-    const budgetContext = {
-      reason,
-      attempted: amount,
-      dailyRemaining,
-      monthlyRemaining,
-      suggestion:
-        `Relay this to the caregiver: the $${amount.toFixed(2)} payment was blocked by the spending policy. ` +
-        `Remaining budget is $${dailyRemaining.toFixed(2)} today and $${monthlyRemaining.toFixed(2)} this month for ${TRANSACTION_CATEGORY.MEDICATIONS}. ` +
-        `Ask them to approve a one-time override, or choose a cheaper option that fits the remaining budget.`,
-    };
-
-    return {
-      success: false,
-      error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
-      transaction,
-      budgetContext,
-    };
+    // Reserve the budget before releasing the mutex so no other concurrent call
+    // can observe the pre-payment balance and pass a check it should fail.
+    spendingTracker.medications += amount;
+  } finally {
+    release();
   }
 
   // Execute real MPP charge payment to pharmacy (outside the mutex — can be slow)
@@ -2670,7 +2697,7 @@ export async function payForMedication(
   const reminderDate = new Date(
     Date.now() + daysSupply * 24 * 60 * 60 * 1000,
   ).toISOString();
-  appendAdherenceEntry({
+  await appendAdherenceEntry({
     recipientId: currentRecipientId,
     reminderDate,
     drug: drugName,
@@ -3004,18 +3031,14 @@ export async function payBill(
       return {
         success: false,
         error: `REQUIRES CAREGIVER APPROVAL: ${amount.toFixed(2)} exceeds the ${currentPolicy.approvalThreshold} approval threshold.`,
-        transaction,
+        transaction: tx,
       };
     }
 
-    policyBlocksTotal.inc({
-      reason: policyCheck.reason!.includes("daily") ? "daily_limit" : "budget",
-    });
-    return {
-      success: false,
-      error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
-      transaction,
-    };
+    // Reserve the budget before releasing the mutex.
+    spendingTracker.bills += amount;
+  } finally {
+    releaseBill();
   }
 
   // Execute real Stellar USDC transfer (serialised per-keypair to avoid sequence races — Issue #XXX)
@@ -3272,7 +3295,7 @@ interface AdherenceEntry {
   skippedCount: number;
   flagged: boolean;
 }
-function appendAdherenceEntry(
+async function appendAdherenceEntry(
   entry: Omit<
     AdherenceEntry,
     "responded" | "taken" | "skippedCount" | "flagged"
@@ -3285,9 +3308,13 @@ function appendAdherenceEntry(
     skippedCount: 0,
     flagged: false,
   };
-  writeFileSync(ADHERENCE_FILE, JSON.stringify(fullEntry) + "\n", {
-    flag: "a",
-  });
+  try {
+    await fsPromises.appendFile(ADHERENCE_FILE, JSON.stringify(fullEntry) + "\n");
+  } catch {
+    try {
+      appendFileSync(ADHERENCE_FILE, JSON.stringify(fullEntry) + "\n");
+    } catch {}
+  }
 }
 
 export interface DisputeRecord {
@@ -3406,9 +3433,10 @@ export function generateDisputeLetter(
 }
 
 // --- Tool: Adherence status (Issue #264) ---
-export function getAdherenceStatus(recipientId: string = "rosa") {
-  // Read adherence log once; summary already contains pendingNow and flaggedRecords (#1042).
-  const summary = getAdherenceSummary(recipientId);
+export async function getAdherenceStatus(recipientId: string = "rosa") {
+  const summary = await getAdherenceSummary(recipientId);
+  const pending = await getPendingAdherences(recipientId);
+  const flagged = await getFlaggedAdherences(recipientId);
   return {
     ...summary,
     pendingReminders: summary.pendingNow.length,
@@ -3416,8 +3444,8 @@ export function getAdherenceStatus(recipientId: string = "rosa") {
   };
 }
 
-export function confirmAdherenceReminder(recordId: string) {
-  return { success: confirmAdherence(recordId) };
+export async function confirmAdherenceReminder(recordId: string) {
+  return { success: await confirmAdherence(recordId) };
 }
 
 const recipientIdSchema = z.string().min(1).optional();
@@ -3657,8 +3685,7 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: "pay_for_medication",
-    description:
-      "Pay a pharmacy for a medication order via MPP Charge on Stellar (real USDC payment). Subject to spending policy limits. Amount must be between $0.01 and $10,000. If the payment is blocked by spending policy, the result includes a budgetContext object { reason, attempted, dailyRemaining, monthlyRemaining, suggestion }: relay it to the caregiver so they can either approve a one-time override or pick a cheaper option within the remaining budget.",
+    description: `Pay a pharmacy for a medication order via MPP Charge on Stellar (real USDC payment). Subject to spending policy limits. Amount must be between $0.01 and $${MAX_PAYMENT}. If the payment is blocked by spending policy, the result includes a budgetContext object { reason, attempted, dailyRemaining, monthlyRemaining, suggestion }: relay it to the caregiver so they can either approve a one-time override or pick a cheaper option within the remaining budget. Optionally supports splitting costs across contributing caregivers.`,
     input_schema: strictInputSchema({
       type: "object" as const,
       properties: {
@@ -3945,4 +3972,3 @@ export {
   recordDosageChange,
   getActiveDosageAtTime,
 };
-

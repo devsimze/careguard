@@ -33,6 +33,7 @@ import { applySecurityMiddleware } from "./shared/security-middleware.ts";
 import { createApiDocsRouter } from "./shared/api-docs.ts";
 import { logger } from "./shared/logger.ts";
 import { requireApiKey } from "./shared/auth.ts";
+import { createPharmacyAdminAuth } from "./shared/pharmacy-admin-auth.ts";
 import {
   validateTask,
   getSuspiciousTaskCount,
@@ -143,8 +144,7 @@ import { createVitalsStore } from "./services/vitals/db.ts";
 import { createVitalsRouter } from "./services/vitals/routes.ts";
 import { getInteractionCheckStore } from "./services/interaction-checks/db.ts";
 import { createInteractionChecksRouter } from "./services/interaction-checks/routes.ts";
-import { getAgentHistoryStore } from "./services/agent-history/db.ts";
-import { createAgentHistoryRouter } from "./services/agent-history/routes.ts";
+import { createCarePlanRouter } from "./services/care-plan/routes.ts";
 import {
   buildCompareResponse,
   DrugRecordSchema,
@@ -259,6 +259,87 @@ const NETWORK = (
   env.data.STELLAR_NETWORK === "public" ? "stellar:public" : "stellar:testnet"
 ) as `${string}:${string}`;
 
+interface DuplicateAllowlistEntry {
+  code: string;
+}
+
+interface AuditThresholdConfig {
+  default: number;
+  byCpt: Record<string, number>;
+}
+
+const DEFAULT_DUPLICATE_ALLOWLIST = new Set(["96372", "97110"]);
+let duplicateAllowlist = new Set(DEFAULT_DUPLICATE_ALLOWLIST);
+let auditThresholds: AuditThresholdConfig = {
+  default: env.data.BILL_AUDIT_OVERCHARGE_MULTIPLIER,
+  byCpt: {},
+};
+
+function loadBillAuditConfig() {
+  try {
+    const allowlistPath = fileURLToPath(
+      new URL(
+        "./services/bill-audit-api/duplicates-allowlist.json",
+        import.meta.url,
+      ),
+    );
+    const entries = JSON.parse(
+      readFileSync(allowlistPath, "utf-8"),
+    ) as DuplicateAllowlistEntry[];
+    duplicateAllowlist = new Set(entries.map((entry) => entry.code));
+    logger.info(
+      { count: duplicateAllowlist.size },
+      "Loaded bill-audit duplicate allowlist",
+    );
+  } catch (error) {
+    logger.error({ error }, "Failed to load bill-audit duplicate allowlist");
+    duplicateAllowlist = new Set(DEFAULT_DUPLICATE_ALLOWLIST);
+  }
+
+  try {
+    const thresholdsPath = fileURLToPath(
+      new URL(
+        "./services/bill-audit-api/audit_thresholds.json",
+        import.meta.url,
+      ),
+    );
+    const thresholds = JSON.parse(
+      readFileSync(thresholdsPath, "utf-8"),
+    ) as AuditThresholdConfig;
+    if (process.env.BILL_AUDIT_OVERCHARGE_MULTIPLIER) {
+      thresholds.default = env.data.BILL_AUDIT_OVERCHARGE_MULTIPLIER;
+    }
+    auditThresholds = thresholds;
+    logger.info(
+      {
+        default: thresholds.default,
+        cptCount: Object.keys(thresholds.byCpt).length,
+      },
+      "Loaded bill-audit thresholds",
+    );
+  } catch (error) {
+    logger.error({ error }, "Failed to load bill-audit thresholds");
+    auditThresholds = {
+      default: env.data.BILL_AUDIT_OVERCHARGE_MULTIPLIER,
+      byCpt: {},
+    };
+  }
+}
+
+function getAuditThreshold(cptCode: string): number {
+  return (
+    auditThresholds.byCpt[cptCode] ??
+    auditThresholds.default ??
+    env.data.BILL_AUDIT_OVERCHARGE_MULTIPLIER
+  );
+}
+
+loadBillAuditConfig();
+process.on("SIGHUP", () => {
+  logger.info("SIGHUP received, reloading bill-audit configuration");
+  loadBillAuditConfig();
+});
+
 const llm = new OpenAI({ apiKey: env.data.LLM_API_KEY, baseURL: LLM_BASE_URL });
 const agentKeypair = Keypair.fromSecret(env.data.AGENT_SECRET_KEY);
 
@@ -267,7 +348,6 @@ const MAX_TOOL_CALLS_PER_RUN = parseInt(
   process.env.MAX_TOOL_CALLS_PER_RUN || "30",
   10,
 );
-let toolCallCapHitsTotal = 0;
 
 // --- Per-run iteration cap (default 15) ---
 const MAX_AGENT_ITERATIONS = Math.max(
@@ -892,6 +972,11 @@ app.post(
       const auditResult = auditBill(sanitizedLineItems, {
         network: NETWORK,
         payTo: process.env.BILL_PROVIDER_PUBLIC_KEY,
+        duplicateAllowlist,
+        getAuditThreshold,
+        overchargeMultiplier: env.data.BILL_AUDIT_OVERCHARGE_MULTIPLIER,
+        suggestedMultiplier: env.data.BILL_AUDIT_SUGGESTED_MULTIPLIER,
+        upcodedMultiplier: env.data.BILL_AUDIT_UPCODED_MULTIPLIER,
         providerHistoryLookup,
       });
 
@@ -1164,22 +1249,22 @@ const _piiScrub = process.env.LLM_PII_SCRUB !== "false";
 app.get("/agent/status", (_req, res) => {
   res.json(getAgentState());
 });
-app.post("/agent/pause", (req, res) => {
+app.post("/agent/pause", async (req, res) => {
   const raw = req.body?.reason;
   const reason: PauseReason =
     raw === "low-balance-usdc" || raw === "low-balance-xlm" ? raw : "manual";
   const state = pauseAgent(reason);
-  appendAuditEntry({
+  await appendAuditEntry({
     event: "agent.paused",
     actor: "api",
     details: { reason },
   });
   res.json(state);
 });
-app.post("/agent/resume", (_req, res) => {
+app.post("/agent/resume", async (_req, res) => {
   const prev = getAgentState();
   const state = resumeAgent();
-  appendAuditEntry({
+  await appendAuditEntry({
     event: "agent.resumed",
     actor: "api",
     details: { previousReason: prev.pausedReason },
@@ -1198,7 +1283,7 @@ app.get("/agent/transactions", (req, res) => {
   );
   res.json({ ...tracker, transactions, pagination });
 });
-app.post("/agent/policy", (req, res) => {
+app.post("/agent/policy", async (req, res) => {
   const result = SpendingPolicySchema.safeParse(req.body);
   if (!result.success) {
     return res
@@ -1215,7 +1300,7 @@ app.post("/agent/policy", (req, res) => {
   if (!outcome.ok) {
     return res.status(400).json({ error: "Invalid policy", message: outcome.error });
   }
-  appendAuditEntry({
+  await appendAuditEntry({
     event: "agent.policy_updated",
     actor: "api",
     details: {
@@ -1252,8 +1337,7 @@ app.post("/agent/adherence/confirm", (req, res) => {
 app.use("/agent", createVitalsRouter(createVitalsStore()));
 // #1193: searchable history of past drug interaction checks.
 app.use("/agent", createInteractionChecksRouter(getInteractionCheckStore()));
-// Searchable transcript of agent tool invocations and their outcomes.
-app.use("/agent", createAgentHistoryRouter(getAgentHistoryStore()));
+app.use("/agent/care-plan", createCarePlanRouter());
 // #1238: preview a policy change against recent payment history.
 app.post("/agent/policy/preview", (req, res) => {
   const result = SpendingPolicySchema.safeParse(req.body);
@@ -1264,9 +1348,9 @@ app.post("/agent/policy/preview", (req, res) => {
   }
   res.json({ impact: previewSpendingPolicy(result.data) });
 });
-app.post("/agent/reset", (req, res) => {
+app.post("/agent/reset", async (req, res) => {
   resetSpendingTracker();
-  appendAuditEntry({
+  await appendAuditEntry({
     event: "agent.reset",
     actor: "api",
     details: {

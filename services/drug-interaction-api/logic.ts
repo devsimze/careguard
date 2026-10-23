@@ -131,7 +131,12 @@ function sortPairsBySeverity(pairs: any[]) {
 }
 
 function toTitleCase(s: string): string {
-  return s.trim().charAt(0).toUpperCase() + s.trim().slice(1).toLowerCase();
+  return s
+    .trim()
+    .toLowerCase()
+    .replace(/(^|[\s-])(\p{L})/gu, (_match, separator: string, letter: string) =>
+      separator + letter.toUpperCase(),
+    );
 }
 
 export function checkInteractions(

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { appendAuditEntry } from "../../shared/audit-log.ts";
+import { appendAuditEntrySync } from "../../shared/audit-log.ts";
 import { logger } from "../../shared/logger.ts";
 import { sanitizeUserString } from "../../shared/sanitize.ts";
 import {
@@ -145,7 +145,7 @@ export function requestProfileChange(
 ): ProfileChangeRequest {
   const request = store.createProfileChangeRequest(input);
   try {
-    appendAuditEntry({
+    appendAuditEntrySync({
       event: "profile_change.requested",
       actor: input.requestedBy,
       details: { requestId: request.id, recipientId: input.recipientId, kind: input.kind, changes: input.changes },
@@ -185,7 +185,7 @@ export function decideProfileChange(
   const decided = store.decideProfileChangeRequest(params.id, params.decision, params.actor, params.note);
   if (!decided) return { ok: false, status: 409, error: "Profile change request was already decided" };
   try {
-    appendAuditEntry({
+    appendAuditEntrySync({
       event: params.decision === "approved" ? "profile_change.approved" : "profile_change.rejected",
       actor: params.actor,
       details: {

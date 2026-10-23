@@ -30,6 +30,12 @@ export const agentToolCallsTotal = new Counter({
   registers: [registry],
 });
 
+export const agentToolCallCapExceededTotal = new Counter({
+  name: "agent_tool_call_cap_exceeded_total",
+  help: "Total agent runs that exceeded the tool call cap",
+  registers: [registry],
+});
+
 export const paymentsUsdcTotal = new Counter({
   name: "payments_usdc_total",
   help: "Total USDC payments made",
@@ -149,6 +155,20 @@ export const stellarTxBadSeqRetriesTotal = new Counter({
 export const billAuditOversizedRejectionsTotal = new Counter({
   name: "bill_audit_oversized_rejections_total",
   help: "Total bill audit requests rejected for exceeding BILL_AUDIT_MAX_ITEMS",
+  registers: [registry],
+});
+
+export const pharmacyPaymentOrdersTotal = new Counter({
+  name: "pharmacy_payment_orders_total",
+  help: "Total pharmacy medication orders processed",
+  labelNames: ["status", "pharmacy"] as const,
+  registers: [registry],
+});
+
+export const pharmacyMppChargesTotal = new Counter({
+  name: "pharmacy_mpp_charges_total",
+  help: "Total pharmacy MPP charge operations",
+  labelNames: ["status"] as const,
   registers: [registry],
 });
 

@@ -9,7 +9,7 @@ import { logger } from "./logger.ts";
 import { getPushTokens } from "./push-tokens.ts";
 
 export type NotificationLevel = "info" | "warning" | "critical";
-export type NotificationChannel = "email" | "sms" | "slack";
+export type NotificationChannel = "email" | "sms" | "slack" | "push";
 export type NotificationEventType =
   | "approval-needed"
   | "policy-blocked"
@@ -71,13 +71,13 @@ export const DEFAULT_NOTIFICATION_OPT_IN: NotificationOptIn = {
 };
 
 export const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferenceMap = {
-  "approval-needed": { email: true, sms: false, slack: true },
-  "policy-blocked": { email: true, sms: false, slack: true },
-  "wallet-low": { email: true, sms: true, slack: true },
-  "price-drop": { email: false, sms: false, slack: true },
-  "bill-audit": { email: true, sms: false, slack: false },
-  "critical-safety": { email: true, sms: true, slack: true },
-  system: { email: true, sms: false, slack: true },
+  "approval-needed": { email: true, sms: false, slack: true, push: false },
+  "policy-blocked": { email: true, sms: false, slack: true, push: false },
+  "wallet-low": { email: true, sms: true, slack: true, push: false },
+  "price-drop": { email: false, sms: false, slack: true, push: false },
+  "bill-audit": { email: true, sms: false, slack: false, push: false },
+  "critical-safety": { email: true, sms: true, slack: true, push: false },
+  system: { email: true, sms: false, slack: true, push: false },
 };
 
 export function shouldSendNotification(
@@ -197,6 +197,54 @@ async function sendSms(n: Notification): Promise<void> {
   } catch (err: any) {
     logger.warn({ err: err?.message ?? err }, "failed to send SMS via Twilio");
   }
+}
+
+async function sendPushToOne(token: string, n: Notification): Promise<boolean> {
+  if (!PUSH_WEBHOOK_URL) return false;
+
+  try {
+    const res = await fetch(PUSH_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token,
+        title: `[CareGuard] ${n.title}`,
+        body: n.description,
+        data: {
+          level: n.level,
+          context: n.context ?? {},
+        },
+      }),
+    });
+    if (!res.ok) {
+      logger.warn(
+        { status: res.status, token: token.slice(0, 12) + "…" },
+        "push webhook returned non-OK status",
+      );
+      return false;
+    }
+    return true;
+  } catch (err: any) {
+    logger.warn(
+      { err: err?.message ?? err, token: token.slice(0, 12) + "…" },
+      "failed to deliver push notification",
+    );
+    return false;
+  }
+}
+
+async function sendPush(n: Notification): Promise<void> {
+  let tokens: string[] = [];
+
+  if (n.recipientPushToken) {
+    tokens = [n.recipientPushToken];
+  } else if (n.recipientCaregiverId) {
+    tokens = getPushTokens(n.recipientCaregiverId).map((e) => e.token);
+  }
+
+  if (tokens.length === 0) return;
+
+  await Promise.allSettled(tokens.map((t) => sendPushToOne(t, n)));
 }
 
 export async function notify(

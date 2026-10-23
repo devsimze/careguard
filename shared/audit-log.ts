@@ -23,6 +23,7 @@ import {
   readSync,
   closeSync,
   writeFileSync,
+  promises as fsPromises,
 } from "fs";
 import { Router, Request, Response } from "express";
 import { fileURLToPath } from "url";
@@ -30,6 +31,7 @@ import lock from "proper-lockfile";
 import { createHash } from "crypto";
 
 export function getAuditFilePath(): string {
+  if (process.env.AUDIT_LOG_FILE) return process.env.AUDIT_LOG_FILE;
   const dataDir =
     process.env.DATA_DIR || fileURLToPath(new URL("../data", import.meta.url));
   if (!existsSync(dataDir)) {
@@ -97,6 +99,67 @@ export function getLastLine(filePath: string): string | null {
   }
 }
 
+export async function getLastLineAsync(filePath: string): Promise<string | null> {
+  try {
+    const stat = await fsPromises.stat(filePath);
+    if (stat.size === 0) return null;
+
+    const fileHandle = await fsPromises.open(filePath, "r");
+    try {
+      const bufferSize = 1024;
+      const buffer = Buffer.alloc(bufferSize);
+      let position = stat.size;
+      let lastLine = "";
+
+      while (position > 0) {
+        const length = Math.min(position, bufferSize);
+        position -= length;
+        const { bytesRead } = await fileHandle.read(buffer, 0, length, position);
+
+        const chunk = buffer.toString("utf8", 0, bytesRead);
+        lastLine = chunk + lastLine;
+
+        const newlineIndex = lastLine.lastIndexOf("\n", lastLine.length - 2);
+        if (newlineIndex !== -1) {
+          lastLine = lastLine.slice(newlineIndex + 1);
+          break;
+        }
+      }
+      const trimmed = lastLine.trim();
+      return trimmed || null;
+    } finally {
+      await fileHandle.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+async function rotateLogsAsync(): Promise<void> {
+  const auditFile = getAuditFilePath();
+  try {
+    const stats = await fsPromises.stat(auditFile);
+    if (stats.size >= MAX_FILE_SIZE) {
+      const oldestLog = `${auditFile}.${MAX_ARCHIVES}`;
+      try {
+        await fsPromises.unlink(oldestLog);
+      } catch {}
+      for (let i = MAX_ARCHIVES - 1; i >= 1; i--) {
+        const currentLog = `${auditFile}.${i}`;
+        const nextLog = `${auditFile}.${i + 1}`;
+        try {
+          await fsPromises.rename(currentLog, nextLog);
+        } catch {}
+      }
+      await fsPromises.rename(auditFile, `${auditFile}.1`);
+    }
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      process.stderr.write(`audit-log: failed to rotate logs: ${err}\n`);
+    }
+  }
+}
+
 function rotateLogs() {
   const auditFile = getAuditFilePath();
   try {
@@ -118,7 +181,7 @@ function rotateLogs() {
   }
 }
 
-export function appendAuditEntry(entry: AuditEntry): void {
+export function appendAuditEntrySync(entry: AuditEntry): void {
   rotateLogs();
 
   const payload = {
@@ -134,7 +197,6 @@ export function appendAuditEntry(entry: AuditEntry): void {
       writeFileSync(auditFile, "", "utf-8");
     }
 
-    // Acquire lock synchronously to prevent race conditions during write
     release = lock.lockSync(auditFile, { stale: 5000 });
 
     const lastLine = getLastLine(auditFile);
@@ -171,6 +233,79 @@ export function appendAuditEntry(entry: AuditEntry): void {
     if (release) {
       try {
         release();
+      } catch (err: any) {
+        process.stderr.write(
+          `audit-log: failed to release lock: ${err?.message ?? err}\n`,
+        );
+      }
+    }
+  }
+}
+
+export async function appendAuditEntry(entry: AuditEntry): Promise<void> {
+  await rotateLogsAsync();
+
+  const payload = {
+    timestamp: new Date().toISOString(),
+    ...entry,
+  };
+
+  const auditFile = getAuditFilePath();
+
+  let release: (() => Promise<void>) | undefined;
+  try {
+    try {
+      await fsPromises.access(auditFile);
+    } catch {
+      await fsPromises.writeFile(auditFile, "", "utf-8");
+    }
+
+    // Acquire lock asynchronously to prevent blocking event loop (Issue #1011)
+    release = await lock.lock(auditFile, {
+      stale: 5000,
+      retries: {
+        retries: 30,
+        factor: 1.1,
+        minTimeout: 30,
+        maxTimeout: 150,
+        randomize: true,
+      },
+    });
+
+    const lastLine = await getLastLineAsync(auditFile);
+    let prevHash =
+      "0000000000000000000000000000000000000000000000000000000000000000";
+
+    if (lastLine) {
+      try {
+        const parsed = JSON.parse(lastLine);
+        if (parsed && typeof parsed.hash === "string") {
+          prevHash = parsed.hash;
+        }
+      } catch (e) {
+        // Fallback to genesis prevHash if last entry is malformed
+      }
+    }
+
+    const serializedPayload = canonicalize(payload);
+    const hashInput = prevHash + serializedPayload;
+    const hash = createHash("sha256").update(hashInput).digest("hex");
+
+    const line = JSON.stringify({
+      ...payload,
+      prevHash,
+      hash,
+    });
+
+    await fsPromises.appendFile(auditFile, line + "\n", "utf-8");
+  } catch (err: any) {
+    process.stderr.write(
+      `audit-log: failed to write entry: ${err?.message ?? err}\n`,
+    );
+  } finally {
+    if (release) {
+      try {
+        await release();
       } catch (err: any) {
         process.stderr.write(
           `audit-log: failed to release lock: ${err?.message ?? err}\n`,
@@ -351,3 +486,47 @@ auditRouter.get(
     }
   },
 );
+
+export function verifyAuditLog(filePath?: string): {
+  valid: boolean;
+  entries: number;
+  corruptedLine?: number;
+  error?: string;
+} {
+  const target = filePath || getAuditFilePath();
+  if (!existsSync(target)) return { valid: true, entries: 0 };
+  const content = readFileSync(target, "utf-8");
+  const lines = content.trim().split("\n").filter(Boolean);
+  let prevExpectedHash =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+  for (let i = 0; i < lines.length; i++) {
+    try {
+      const parsed = JSON.parse(lines[i]);
+      if (parsed.prevHash !== prevExpectedHash) {
+        return {
+          valid: false,
+          entries: i,
+          corruptedLine: i + 1,
+          error: `prevHash mismatch at line ${i + 1}`,
+        };
+      }
+      const { prevHash: _p, hash: currentHash, ...payload } = parsed;
+      const calculated = createHash("sha256")
+        .update(prevExpectedHash + canonicalize(payload))
+        .digest("hex");
+      if (calculated !== currentHash) {
+        return {
+          valid: false,
+          entries: i,
+          corruptedLine: i + 1,
+          error: `hash mismatch at line ${i + 1}`,
+        };
+      }
+      prevExpectedHash = currentHash;
+    } catch (e: any) {
+      return { valid: false, entries: i, corruptedLine: i + 1, error: e.message };
+    }
+  }
+  return { valid: true, entries: lines.length };
+}

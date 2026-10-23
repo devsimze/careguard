@@ -27,18 +27,45 @@ export interface CacheClient {
 
 // ─── In-process fallback ──────────────────────────────────────────────────────
 
-export function createInMemoryClient(): CacheClient {
+/** Expired in-memory entries are swept once per minute by default. */
+export const IN_MEMORY_SWEEP_INTERVAL_MS = 60_000;
+
+export interface InMemoryCacheClient extends CacheClient {
+  readonly size: number;
+}
+
+export function createInMemoryClient(
+  sweepIntervalMs = IN_MEMORY_SWEEP_INTERVAL_MS,
+): InMemoryCacheClient {
+  if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs <= 0) {
+    throw new RangeError("sweepIntervalMs must be a positive finite number");
+  }
+
   interface Entry {
     value: string;
     expiresAt: number | null;
   }
   const store = new Map<string, Entry>();
 
+  const sweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of store) {
+      if (entry.expiresAt !== null && now >= entry.expiresAt) {
+        store.delete(key);
+      }
+    }
+  }, sweepIntervalMs);
+  sweepTimer.unref();
+
   function live(entry: Entry): boolean {
     return entry.expiresAt === null || Date.now() < entry.expiresAt;
   }
 
   return {
+    get size() {
+      return store.size;
+    },
+
     async get(key) {
       const entry = store.get(key);
       if (!entry || !live(entry)) {

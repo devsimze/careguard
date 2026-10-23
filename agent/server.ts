@@ -10,14 +10,16 @@
 
 import "dotenv/config";
 import { createHash } from "crypto";
+import { resolve } from "path";
+import { fileURLToPath } from "url";
 import {
   existsSync,
   mkdirSync,
   readFileSync,
   writeFileSync,
   renameSync,
+  promises as fsPromises,
 } from "fs";
-import { existsSync, mkdirSync } from "fs";
 import express, { type Express } from "express";
 import OpenAI from "openai";
 import { Keypair, Horizon } from "@stellar/stellar-sdk";
@@ -37,10 +39,9 @@ import {
 import { startOrderStatusReminderCron } from "../shared/order-status-reminder.ts";
 import { rateLimiters } from "../shared/rate-limit.ts";
 import { agentQueue } from "../shared/agent-queue.ts";
-import { requestContextMiddleware } from "../shared/request-context.ts";
-import { requestLoggerMiddleware } from "../shared/request-logger.ts";
+import { requestLifecycleMiddleware } from "../shared/request-lifecycle.ts";
 import { metricsHandler, agentRunsTotal } from "../shared/metrics.ts";
-import { redactPII, hashTask } from "../shared/redact.ts";
+import { redactPII, hashTask, registerKnownNames } from "../shared/redact.ts";
 import {
   getSpendingSummary,
   getWalletBalance,
@@ -62,8 +63,6 @@ import { createVitalsStore } from "../services/vitals/db.ts";
 import { createVitalsRouter } from "../services/vitals/routes.ts";
 import { getInteractionCheckStore } from "../services/interaction-checks/db.ts";
 import { createInteractionChecksRouter } from "../services/interaction-checks/routes.ts";
-import { getAgentHistoryStore } from "../services/agent-history/db.ts";
-import { createAgentHistoryRouter } from "../services/agent-history/routes.ts";
 import { createCareRecipientsStore } from "../services/care-recipients/db.ts";
 import { authorizeApprovalActor, createDelegationsRouter } from "../services/care-recipients/delegation.ts";
 import { createInsuranceNetworkRouter } from "../services/care-recipients/insurance-network.ts";
@@ -261,23 +260,36 @@ app.use(rateLimiters.default);
 
 applySecurityMiddleware(app);
 app.use(createCorsMiddleware());
-app.use(express.json({ limit: process.env.JSON_BODY_LIMIT ?? "20kb" }));
+app.use(
+  express.json({
+    limit: process.env.JSON_BODY_LIMIT ?? "20kb",
+    type: (req) =>
+      req.path !== "/webhooks/stellar/deposit" &&
+      Boolean(req.is("application/json")),
+  }),
+);
 app.use(requestLifecycleMiddleware());
 app.get("/metrics", metricsHandler());
 
 // Per-run tool call cap
-const MAX_TOOL_CALLS_PER_RUN = parseInt(
-  process.env.MAX_TOOL_CALLS_PER_RUN || "30",
-  10,
-);
-let toolCallCapHitsTotal = 0;
+const MAX_TOOL_CALLS_PER_RUN = parseInt(process.env.MAX_TOOL_CALLS_PER_RUN || "30", 10);
 
 // ── Persisted agent-pause state (Issue #17) ──────────────────────────────────
 // Persists to data/agent-state.json so a paused agent stays paused across
 // restarts.  Writes are atomic (tmp + rename) to avoid corrupt reads.
-const AGENT_STATE_FILE = () => `${getDataDir()}/agent-state.json`;
+const AGENT_STATE_FILE = () => process.env.AGENT_STATE_FILE || `${getDataDir()}/agent-state.json`;
 
-function loadAgentState(): { paused: boolean } {
+export async function loadAgentState(): Promise<{ paused: boolean }> {
+  try {
+    const file = AGENT_STATE_FILE();
+    const data = await fsPromises.readFile(file, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return { paused: false };
+  }
+}
+
+export function loadAgentStateSync(): { paused: boolean } {
   try {
     const file = AGENT_STATE_FILE();
     if (!existsSync(file)) return { paused: false };
@@ -287,18 +299,18 @@ function loadAgentState(): { paused: boolean } {
   }
 }
 
-function saveAgentState(state: { paused: boolean }): void {
+export async function saveAgentState(state: { paused: boolean }): Promise<void> {
   try {
     const file = AGENT_STATE_FILE();
-    const tmp = `${file}.tmp-${Date.now()}`;
-    writeFileSync(tmp, JSON.stringify(state), "utf-8");
-    renameSync(tmp, file);
+    const tmp = `${file}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    await fsPromises.writeFile(tmp, JSON.stringify(state), "utf-8");
+    await fsPromises.rename(tmp, file);
   } catch (err) {
     logger.warn({ err }, "[agent-state] Failed to persist agent state");
   }
 }
 
-let agentPaused = loadAgentState().paused;
+let agentPaused = (await loadAgentState()).paused;
 
 app.get("/agent/wallet", async (req, res) => {
   const address = agentKeypair.publicKey();
@@ -422,8 +434,8 @@ app.get("/", (_req, res) => {
     network: `stellar:${STELLAR_CONFIG.networkType}`,
     llm: `${LLM_BASE_URL} / ${LLM_MODEL}`,
     agentWallet: agentKeypair.publicKey(),
-    recipients: ["rosa"],
-    caregiver: "Maria Garcia",
+    recipients: Object.keys(recipientProfiles),
+    caregiver: caregiverProfile.name,
     paused: agentPaused,
   });
 });
@@ -431,9 +443,9 @@ app.get("/", (_req, res) => {
 app.get("/agent/status", (_req, res) => {
   res.json({ paused: agentPaused });
 });
-app.post("/agent/pause", (_req, res) => {
+app.post("/agent/pause", async (_req, res) => {
   agentPaused = true;
-  saveAgentState({ paused: true });
+  await saveAgentState({ paused: true });
   logger.info("agent paused by caregiver");
   notify({
     level: "warning",
@@ -444,9 +456,9 @@ app.post("/agent/pause", (_req, res) => {
   broadcastSSE("status", { paused: true });
   res.json({ paused: true });
 });
-app.post("/agent/resume", (_req, res) => {
+app.post("/agent/resume", async (_req, res) => {
   agentPaused = false;
-  saveAgentState({ paused: false });
+  await saveAgentState({ paused: false });
   logger.info("agent resumed by caregiver");
   notify({
     level: "info",
@@ -581,7 +593,7 @@ app.get("/agent/transactions", (req, res) => {
   setCurrentRecipient(recipientId);
   res.json(getSpendingTracker());
 });
-app.post("/agent/policy", (req, res) => {
+app.post("/agent/policy", async (req, res) => {
   const result = SpendingPolicySchema.safeParse(req.body);
   if (!result.success) {
     return res
@@ -599,7 +611,7 @@ app.post("/agent/policy", (req, res) => {
   if (!outcome.ok) {
     return res.status(400).json({ error: "Invalid policy", message: outcome.error });
   }
-  appendAuditEntry({
+  await appendAuditEntry({
     event: "agent.policy_updated",
     actor: "api",
     details: {
@@ -629,11 +641,11 @@ app.post("/agent/policy/preview", (req, res) => {
   setCurrentRecipient(recipientId);
   res.json({ recipientId, impact: previewSpendingPolicy(result.data) });
 });
-app.post("/agent/reset", (req, res) => {
+app.post("/agent/reset", async (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
   setCurrentRecipient(recipientId);
   resetSpendingTracker();
-  appendAuditEntry({
+  await appendAuditEntry({
     event: "agent.reset",
     actor: "api",
     details: {
@@ -707,9 +719,6 @@ app.put("/agent/recipients/:recipientId", (req, res) => {
     recipientProfiles[recipientId].medications = medications;
   if (doctor) recipientProfiles[recipientId].doctor = doctor;
   if (insurance) recipientProfiles[recipientId].insurance = insurance;
-  const dir = new URL(`../data/recipients/${recipientId}`, import.meta.url)
-    .pathname;
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   res.json({ success: true, recipient: recipientProfiles[recipientId] });
 });
 
@@ -751,37 +760,37 @@ app.patch("/agent/profile", (req, res) => {
 });
 
 // --- Adherence endpoints (#264) ---
-app.get("/agent/adherence", (req, res) => {
+app.get("/agent/adherence", async (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  res.json(getAdherenceStatus(recipientId));
+  res.json(await getAdherenceStatus(recipientId));
 });
 
-app.get("/agent/adherence/pending", (req, res) => {
+app.get("/agent/adherence/pending", async (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  const pending = getPendingAdherences(recipientId);
+  const pending = await getPendingAdherences(recipientId);
   res.json({ pending, count: pending.length, recipientId });
 });
 
 // #1237: dated adherence events, charted alongside logged vitals.
-app.get("/agent/adherence/timeline", (req, res) => {
+app.get("/agent/adherence/timeline", async (req, res) => {
   const recipientId = (req.query.recipient_id as string) || "rosa";
-  res.json({ recipientId, events: getAdherenceTimeline(recipientId) });
+  res.json({ recipientId, events: await getAdherenceTimeline(recipientId) });
 });
 
-app.post("/agent/adherence/confirm", (req, res) => {
+app.post("/agent/adherence/confirm", async (req, res) => {
   const { record_id } = req.body ?? {};
   if (!record_id)
     return res.status(400).json({ error: "record_id is required" });
-  const success = confirmAdherenceReminder(record_id);
+  const success = await confirmAdherenceReminder(record_id);
   res.json({ success: success.success });
 });
 
 // #1254: the OverviewTab adherence check's "Not Yet" — marks the most recent
 // pending dose as skipped so persistent skips can escalate to flagged.
-app.post("/agent/adherence/skip", (req, res) => {
+app.post("/agent/adherence/skip", async (req, res) => {
   const { record_id } = req.body ?? {};
   if (!record_id) return res.status(400).json({ error: "record_id is required" });
-  const success = skipAdherence(record_id);
+  const success = await skipAdherence(record_id);
   res.json({ success });
 });
 
@@ -1032,9 +1041,24 @@ app.post(
   express.raw({ type: "application/json" }),
   verifyWebhook(),
   (req: express.Request, res: express.Response) => {
-    const payload = JSON.parse(
-      Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body),
-    ) as Record<string, unknown>;
+    const rawBody = Buffer.isBuffer(req.body)
+      ? req.body.toString("utf8")
+      : String(req.body);
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(rawBody) as Record<string, unknown>;
+    } catch (err) {
+      logger.warn(
+        {
+          err,
+          webhookId: req.headers["x-webhook-id"],
+          bodyLength: rawBody.length,
+        },
+        "invalid JSON in stellar deposit webhook",
+      );
+      res.status(400).json({ error: "Invalid JSON in webhook payload" });
+      return;
+    }
     logger.info({ payload }, "stellar deposit webhook received");
     res.status(200).json({ status: "received" });
   },
@@ -1067,22 +1091,28 @@ app.get("/ready", (_req, res) => {
 
 export { app };
 
-const server = app.listen(PORT, async () => {
-  logger.info(
-    {
-      port: PORT,
-      network: STELLAR_CONFIG.networkType,
-      horizonUrl: STELLAR_CONFIG.horizonUrl,
-      llm: LLM_MODEL,
-      llmBaseUrl: LLM_BASE_URL,
-      llmToolTemperature: LLM_TOOL_TEMPERATURE,
-      llmSummaryTemperature: LLM_SUMMARY_TEMPERATURE,
-      wallet: agentKeypair.publicKey(),
-    },
-    "CareGuard Agent started",
-  );
-  await verifyWallet();
-  startOrderStatusReminderCron();
-});
+let server: ReturnType<typeof app.listen> | undefined;
 
-gracefulShutdown({ server, onDrainStart: () => { isDraining = true; } });
+if (process.env.NODE_ENV !== "test" && !process.env.VITEST) {
+  server = app.listen(PORT, async () => {
+    logger.info(
+      {
+        port: PORT,
+        network: STELLAR_CONFIG.networkType,
+        horizonUrl: STELLAR_CONFIG.horizonUrl,
+        llm: LLM_MODEL,
+        llmBaseUrl: LLM_BASE_URL,
+        llmToolTemperature: LLM_TOOL_TEMPERATURE,
+        llmSummaryTemperature: LLM_SUMMARY_TEMPERATURE,
+        wallet: agentKeypair.publicKey(),
+      },
+      "CareGuard Agent started",
+    );
+    await verifyWallet();
+    startOrderStatusReminderCron();
+  });
+
+  gracefulShutdown({ server, onDrainStart: () => { isDraining = true; } });
+}
+
+export { server };

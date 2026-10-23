@@ -42,7 +42,7 @@ vi.mock("fs", () => ({
   appendFileSync: vi.fn(),
   existsSync: vi.fn((p: string) =>
     String(p).includes("spending.snapshot.json") ||
-    String(p).includes("spending.json") ||
+    (String(p).includes("recipients") && String(p).includes("spending.json")) ||
     (String(p).includes("policy.json") && policyFile.content !== null),
   ),
   mkdirSync: vi.fn(),
@@ -95,9 +95,11 @@ import {
   getSpendingTracker,
   resetSpendingTracker,
   setSpendingPolicy,
+  getToolFee,
   TOOL_DEFINITIONS,
 } from "../tools.ts";
 import { decodePaymentResponseHeader } from "@x402/fetch";
+import { writeFileSync } from "fs";
 
 const mockedDecodeHeader = vi.mocked(decodePaymentResponseHeader);
 
@@ -127,6 +129,24 @@ function connectionRefused(): TypeError {
     }),
   });
 }
+
+describe("getToolFee", () => {
+  it("returns the default fee when a tool fee is missing", () => {
+    policyFile.content = JSON.stringify({ toolFees: {} });
+    expect(getToolFee("futurePaidTool")).toBe(0.001);
+  });
+
+  it("preserves explicitly configured tool fees", () => {
+    policyFile.content = JSON.stringify({ toolFees: { configuredTool: 0.025 } });
+    expect(getToolFee("configuredTool")).toBe(0.025);
+  });
+});
+
+describe("legacy data migration", () => {
+  it("does not write files when neither legacy file exists", () => {
+    expect(writeFileSync).not.toHaveBeenCalled();
+  });
+});
 
 // ── Mock-network happy paths ──────────────────────────────────────────────────
 

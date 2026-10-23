@@ -416,7 +416,7 @@ export function createCareRecipientsRouter(
     }));
 
     // 7. Adherence Records
-    const adherenceList = readAdherenceRecords()
+    const adherenceList = (await readAdherenceRecords())
       .filter((r) => r.recipientId === cleanId)
       .map((r) => ({
         drug: r.drug,
